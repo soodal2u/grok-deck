@@ -1,0 +1,41 @@
+appId: app.grokdeck.desktop
+productName: Grok Deck
+copyright: Copyright © Grok Deck
+
+directories:
+  output: release
+  buildResources: resources
+
+files:
+  - out/**/*
+  - resources/**/*
+  - package.json
+
+extraMetadata:
+  main: out/main/index.js
+
+asar: true
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  icon: resources/icon.ico
+  artifactName: GrokDeck-${version}-Setup.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Grok Deck
+  installerIcon: resources/icon.ico
+  uninstallerIcon: resources/icon.ico
+
+portable:
+  artifactName: GrokDeck-${version}-portable.${ext}

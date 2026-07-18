@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@grok-deck/shared": ["../../packages/shared/src/index.ts"],
+      "@grok-deck/acp-client": ["../../packages/acp-client/src/index.ts"]
+    }
+  },
+  "include": [
+    "electron.vite.config.ts",
+    "src/main/**/*",
+    "src/preload/**/*",
+    "../../packages/shared/src/**/*",
+    "../../packages/acp-client/src/**/*"
+  ]
+}

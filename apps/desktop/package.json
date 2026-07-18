@@ -1,0 +1,35 @@
+{
+  "name": "grok-deck",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Grok Deck desktop command center for Grok agents",
+  "main": "./out/main/index.js",
+  "author": "Grok Deck",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "dist": "npm run build && electron-builder --win",
+    "dist:dir": "npm run build && electron-builder --win --dir"
+  },
+  "dependencies": {
+    "@grok-deck/acp-client": "*",
+    "@grok-deck/shared": "*",
+    "highlight.js": "^11.11.1",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.4",
+    "@types/react-dom": "^19.1.5",
+    "@vitejs/plugin-react": "^4.4.1",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^3.1.0",
+    "sharp": "^0.35.3",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}

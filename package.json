@@ -1,0 +1,26 @@
+{
+  "name": "grok-deck",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Grok Deck — desktop command center for Grok agents (Codex-style UI over grok agent ACP)",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w grok-deck",
+    "build": "npm run build -w grok-deck",
+    "start": "npm run build && node scripts/run-electron.mjs",
+    "dist": "npm run dist -w grok-deck",
+    "dist:dir": "npm run dist:dir -w grok-deck",
+    "postinstall": "node scripts/fix-electron.mjs",
+    "smoke:acp": "node scripts/smoke-acp.mjs",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "electron": "36.2.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
