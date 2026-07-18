@@ -32,7 +32,7 @@ export function deckModeHint(mode: DeckMode): string {
     case "normal":
       return "Ask before edits & shell (Shift+Tab to cycle)";
     case "plan":
-      return "Plan only — file writes blocked (Shift+Tab)";
+      return "Plan only — project writes blocked; plan.md allowed (Shift+Tab)";
     case "yolo":
       return "Auto-approve tools (Shift+Tab / Ctrl+O)";
   }

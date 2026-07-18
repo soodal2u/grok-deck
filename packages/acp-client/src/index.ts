@@ -2,7 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve, relative, isAbsolute, sep } from "node:path";
+import { dirname, resolve, relative, isAbsolute, join, sep } from "node:path";
+import { homedir } from "node:os";
 import type {
   DeckMode,
   FileDiff,
@@ -160,7 +161,7 @@ export class GrokAcpClient extends EventEmitter {
         mode === "yolo"
           ? "Mode: Always-approve (auto tools)"
           : mode === "plan"
-            ? "Mode: Plan (writes blocked)"
+            ? "Mode: Plan (project writes blocked; plan.md allowed)"
             : "Mode: Normal (ask before edits)",
     });
 
@@ -778,8 +779,18 @@ export class GrokAcpClient extends EventEmitter {
       return;
     }
 
-    // Plan: reject mutating tools
+    // Plan: allow tools that only touch session plan.md; block other mutations.
+    // The official agent keeps the plan outside the workspace under ~/.grok/sessions.
     if (this.mode === "plan" && isMutatingTool(toolCall)) {
+      if (isPlanFileTool(toolCall)) {
+        const allow = pickAllowOption(options, true);
+        this.send({
+          jsonrpc: "2.0",
+          id: rpcId,
+          result: { outcome: { outcome: "selected", optionId: allow } },
+        });
+        return;
+      }
       const reject = pickRejectOption(options);
       this.send({
         jsonrpc: "2.0",
@@ -788,7 +799,7 @@ export class GrokAcpClient extends EventEmitter {
       });
       this.emitEvent({
         type: "status",
-        message: "Plan mode blocked a mutating tool — Shift+Tab to leave Plan",
+        message: "Plan mode blocked a project edit — only plan.md is writable (Shift+Tab to leave Plan)",
       });
       return;
     }
@@ -815,7 +826,8 @@ export class GrokAcpClient extends EventEmitter {
     const p = params as { path?: string; line?: number; limit?: number };
     if (!p.path) throw new Error("fs/read_text_file: missing path");
 
-    const abs = this.assertInWorkspace(p.path);
+    // plan.md lives under ~/.grok/sessions (outside workspace) — still readable
+    const abs = this.resolveAllowedPath(p.path);
     let content = await readFile(abs, "utf8");
 
     if (p.line != null || p.limit != null) {
@@ -834,11 +846,37 @@ export class GrokAcpClient extends EventEmitter {
     if (!p.path) throw new Error("fs/write_text_file: missing path");
     if (typeof p.content !== "string") throw new Error("fs/write_text_file: missing content");
 
-    const abs = this.assertInWorkspace(p.path);
+    // Allows workspace paths + session plan.md under ~/.grok/sessions
+    const abs = this.resolveAllowedPath(p.path);
+    const planFile = isGrokSessionPlanPath(abs);
 
-    // Plan mode: never write
-    if (this.mode === "plan") {
-      throw new Error("Plan mode: file writes are blocked. Shift+Tab to Normal or Always-approve.");
+    // Plan mode: only the official session plan.md may be written.
+    // Always-approve is NOT required — plan.md is the whole point of Plan mode.
+    if (this.mode === "plan" && !planFile) {
+      throw new Error(
+        "Plan mode: project file writes are blocked. Only the session plan.md is writable. Shift+Tab to Normal or Always-approve.",
+      );
+    }
+
+    // Session plan.md: auto-write (no permission prompt, no Ghost Git — not project files)
+    if (planFile) {
+      await mkdir(dirname(abs), { recursive: true });
+      await writeFile(abs, p.content, "utf8");
+      this.emitEvent({
+        type: "file_changed",
+        path: abs,
+        action: "write",
+        bytes: Buffer.byteLength(p.content, "utf8"),
+      });
+      this.emitEvent({
+        type: "diff",
+        diff: { path: abs, oldText: null, newText: p.content },
+      });
+      this.emitEvent({
+        type: "status",
+        message: "Plan file updated",
+      });
+      return null;
     }
 
     // Normal mode: ask the user (Grok often does NOT send session/request_permission
@@ -943,19 +981,26 @@ export class GrokAcpClient extends EventEmitter {
     });
   }
 
-  /** Ensure path is under the project cwd (path jail). */
-  private assertInWorkspace(filePath: string): string {
+  /**
+   * Resolve a path the agent may read/write:
+   * - project workspace (path jail)
+   * - session plan.md under ~/.grok/sessions (required for Plan mode)
+   */
+  private resolveAllowedPath(filePath: string): string {
     const abs = resolve(isAbsolute(filePath) ? filePath : resolve(this.cwd, filePath));
+    if (this.isInsideWorkspace(abs)) return abs;
+    if (isGrokSessionPlanPath(abs)) return abs;
+    throw new Error(`Path outside workspace is blocked: ${abs}`);
+  }
+
+  private isInsideWorkspace(abs: string): boolean {
     const rel = relative(this.cwd, abs);
-    if (rel.startsWith("..") || isAbsolute(rel)) {
-      // On Windows, relative can be absolute if different drive
-      const cwdLower = this.cwd.toLowerCase();
-      const absLower = abs.toLowerCase();
-      if (!absLower.startsWith(cwdLower.endsWith(sep) ? cwdLower : cwdLower + sep) && absLower !== cwdLower) {
-        throw new Error(`Path outside workspace is blocked: ${abs}`);
-      }
-    }
-    return abs;
+    if (!(rel.startsWith("..") || isAbsolute(rel))) return true;
+    // On Windows, relative can be absolute if different drive
+    const cwdLower = this.cwd.toLowerCase();
+    const absLower = abs.toLowerCase();
+    const cwdPrefix = cwdLower.endsWith(sep) ? cwdLower : cwdLower + sep;
+    return absLower.startsWith(cwdPrefix) || absLower === cwdLower;
   }
 
   private request(method: string, params: unknown): Promise<unknown> {
@@ -1034,6 +1079,86 @@ function isMutatingTool(toolCall?: ToolCallView): boolean {
   return /write|edit|delete|shell|bash|run_terminal|search_replace|apply_patch/.test(title);
 }
 
+/** Official agent plan file: ~/.grok/sessions/<encoded-cwd>/<session-id>/plan.md */
+function grokSessionsRoot(): string {
+  return resolve(join(homedir(), ".grok", "sessions"));
+}
+
+function isUnderDir(abs: string, root: string): boolean {
+  const a = resolve(abs);
+  const r = resolve(root);
+  const rel = relative(r, a);
+  if (!(rel.startsWith("..") || isAbsolute(rel))) return true;
+  const rLower = r.toLowerCase();
+  const aLower = a.toLowerCase();
+  const prefix = rLower.endsWith(sep) ? rLower : rLower + sep;
+  return aLower.startsWith(prefix) || aLower === rLower;
+}
+
+/**
+ * True for the session plan document the agent is allowed to edit in Plan mode.
+ * Only `plan.md` under ~/.grok/sessions — not arbitrary files outside the workspace.
+ */
+export function isGrokSessionPlanPath(filePath: string): boolean {
+  try {
+    const abs = resolve(filePath);
+    const name = basename(abs).toLowerCase();
+    if (name !== "plan.md") return false;
+    return isUnderDir(abs, grokSessionsRoot());
+  } catch {
+    return false;
+  }
+}
+
+/** Collect file paths a tool call appears to touch. */
+function toolCallPaths(toolCall?: ToolCallView): string[] {
+  if (!toolCall) return [];
+  const out: string[] = [];
+  for (const loc of toolCall.locations || []) {
+    if (loc.path) out.push(loc.path);
+  }
+  for (const d of toolCall.diffs || []) {
+    if (d.path) out.push(d.path);
+  }
+  const fromInput = extractPathFromInput(toolCall.input);
+  if (fromInput) out.push(fromInput);
+  // raw input sometimes nests path under different keys / JSON string
+  if (typeof toolCall.input === "string") {
+    const m = toolCall.input.match(/[A-Za-z]:\\[^"'\n]+plan\.md|\/[^\s"']+plan\.md/i);
+    if (m?.[0]) out.push(m[0]);
+  }
+  return out;
+}
+
+/**
+ * Mutating tool that only targets session plan.md — safe to auto-allow in Plan mode.
+ * If we cannot determine paths, return false (reject / ask rather than open the jail).
+ */
+function isPlanFileTool(toolCall?: ToolCallView): boolean {
+  if (!toolCall) return false;
+  const paths = toolCallPaths(toolCall);
+  if (paths.length === 0) {
+    // Heuristic: titles like "Update plan" / tools named plan without a path
+    const label = `${toolCall.title || ""} ${toolCall.tool || ""} ${toolCall.kind || ""}`.toLowerCase();
+    if (/\bplan\b/.test(label) && !/search_replace|write_file|apply_patch|edit_file/.test(label)) {
+      return true;
+    }
+    return false;
+  }
+  return paths.every((p) => {
+    try {
+      const abs = resolve(isAbsolute(p) ? p : p);
+      // relative paths named plan.md are NOT session plans (workspace)
+      if (!isAbsolute(p) && basename(p).toLowerCase() === "plan.md" && !p.includes(".grok")) {
+        return false;
+      }
+      return isGrokSessionPlanPath(abs) || (basename(abs).toLowerCase() === "plan.md" && /[/\\]\.grok[/\\]sessions[/\\]/i.test(abs));
+    } catch {
+      return false;
+    }
+  });
+}
+
 function summarizeTool(toolCall?: ToolCallView): string | undefined {
   if (!toolCall) return undefined;
   if (toolCall.diffs?.length) {
@@ -1052,10 +1177,27 @@ function summarizeTool(toolCall?: ToolCallView): string | undefined {
 }
 
 function extractPathFromInput(input: unknown): string | undefined {
-  if (!input || typeof input !== "object") return undefined;
+  if (input == null) return undefined;
+  if (typeof input === "string") {
+    // Sometimes raw path or "path\n..." blobs
+    const line = input.split(/\r?\n/)[0]?.trim();
+    if (line && /plan\.md$/i.test(line)) return line;
+    const m = input.match(
+      /(?:[A-Za-z]:\\|\/)[^\s"'<>|*?]+\.grok[\\/]+sessions[\\/]+[^\s"'<>|*?]+plan\.md/i,
+    );
+    return m?.[0];
+  }
+  if (typeof input !== "object") return undefined;
   const o = input as Record<string, unknown>;
-  for (const k of ["path", "file_path", "filePath", "target_file"]) {
-    if (typeof o[k] === "string") return o[k] as string;
+  for (const k of ["path", "file_path", "filePath", "target_file", "file", "filename"]) {
+    if (typeof o[k] === "string" && (o[k] as string).length > 0) return o[k] as string;
+  }
+  // Nested { content: { path } } or ACP-style wrappers
+  for (const nest of ["input", "arguments", "params", "content"]) {
+    if (o[nest] && typeof o[nest] === "object") {
+      const inner = extractPathFromInput(o[nest]);
+      if (inner) return inner;
+    }
   }
   return undefined;
 }
