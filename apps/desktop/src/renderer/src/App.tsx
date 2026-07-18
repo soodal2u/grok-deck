@@ -15,6 +15,7 @@ import type {
   DeckMode,
   FileDiff,
   PermissionOption,
+  PlanDocument,
   ProjectGroup,
   ProjectState,
   SessionSummary,
@@ -45,6 +46,9 @@ import {
 import { Markdown } from "./components/Markdown";
 import { ToolChip, ToolGroup } from "./components/ToolChip";
 import { EditSummaryCard } from "./components/EditSummaryCard";
+import { PlanReviewCard } from "./components/PlanReviewCard";
+import { LiveToolToast } from "./components/LiveToolToast";
+import { PlanStepsPanel } from "./components/PlanStepsPanel";
 import { ContextMeter } from "./components/ContextMeter";
 import { ResizeHandles } from "./components/ResizeHandles";
 import { PanelDivider } from "./components/PanelDivider";
@@ -72,6 +76,49 @@ function relativeDiffStats(diff: FileDiff): { add: number; del: number } {
     add: Math.max(0, newN - Math.min(oldN, newN)),
     del: Math.max(0, oldN - Math.min(oldN, newN)),
   };
+}
+
+/** Build per-file edit stats from tool diffs (fallback when Ghost commit is late/missing). */
+function editFilesFromTools(
+  tools?: ToolCallView[],
+): Array<{ path: string; add: number; del: number }> {
+  if (!tools?.length) return [];
+  const map = new Map<string, { path: string; add: number; del: number }>();
+  for (const t of tools) {
+    if (!isEditTool(t)) continue;
+    if (t.diffs?.length) {
+      for (const d of t.diffs) {
+        const s = relativeDiffStats(d);
+        const prev = map.get(d.path);
+        if (prev) {
+          prev.add += s.add;
+          prev.del += s.del;
+        } else map.set(d.path, { path: d.path, add: s.add, del: s.del });
+      }
+    } else {
+      const loc = t.locations?.[0]?.path;
+      const title = t.title || t.tool || "";
+      const m = title.match(/[`'"]([^`'"]+)[`'"]/);
+      const path = loc || m?.[1];
+      if (path && !map.has(path)) map.set(path, { path, add: 0, del: 0 });
+    }
+  }
+  return [...map.values()];
+}
+
+function mergeEditFiles(
+  a: Array<{ path: string; add: number; del: number }>,
+  b: Array<{ path: string; add: number; del: number }>,
+): Array<{ path: string; add: number; del: number }> {
+  const map = new Map<string, { path: string; add: number; del: number }>();
+  for (const f of [...a, ...b]) {
+    const prev = map.get(f.path);
+    if (prev) {
+      prev.add = Math.max(prev.add, f.add);
+      prev.del = Math.max(prev.del, f.del);
+    } else map.set(f.path, { ...f });
+  }
+  return [...map.values()];
 }
 
 function unifiedDiffPreview(diff: FileDiff, maxLines = 48): string {
@@ -156,6 +203,11 @@ export function App() {
   >([]);
   /** Resolved wallpaper (data URL for custom themes — reliable display) */
   const [wallpaperSrc, setWallpaperSrc] = useState<string | null>(null);
+  /** Codex-style plan review (from plan.md / ACP plan updates) */
+  const [activePlan, setActivePlan] = useState<PlanDocument | null>(null);
+  const [planDismissed, setPlanDismissed] = useState(false);
+  /** State mirror of streaming message id — ref alone does not trigger re-render for `live` */
+  const [liveMessageId, setLiveMessageId] = useState<string | null>(null);
 
   const chatRef = useRef<HTMLDivElement>(null);
   const streamingId = useRef<string | null>(null);
@@ -282,6 +334,7 @@ export function App() {
     if (streamingId.current) return streamingId.current;
     const id = uid("a");
     streamingId.current = id;
+    setLiveMessageId(id);
     setMessages((prev) => [
       ...prev,
       { id, role: "assistant", content: "", thoughts: "", toolCalls: [], createdAt: Date.now() },
@@ -307,25 +360,68 @@ export function App() {
       }
       case "tool_call": {
         const id = ensureAssistantMessage();
-        patchAssistant(id, (m) => ({
-          ...m,
-          toolCalls: [...(m.toolCalls || []).filter((t) => t.id !== event.call.id), event.call],
-        }));
+        patchAssistant(id, (m) => {
+          const toolCalls = [
+            ...(m.toolCalls || []).filter((t) => t.id !== event.call.id),
+            event.call,
+          ];
+          const fromTools = editFilesFromTools(toolCalls);
+          return {
+            ...m,
+            toolCalls,
+            editSummary:
+              fromTools.length > 0
+                ? {
+                    ghostCommitId: m.editSummary?.ghostCommitId || `pending_${id}`,
+                    files: m.editSummary?.files?.length
+                      ? mergeEditFiles(m.editSummary.files, fromTools)
+                      : fromTools,
+                  }
+                : m.editSummary,
+          };
+        });
         break;
       }
       case "tool_call_update": {
         const id = ensureAssistantMessage();
-        patchAssistant(id, (m) => ({
-          ...m,
-          toolCalls: (m.toolCalls || []).map((t) =>
-            t.id === event.call.id ? { ...t, ...event.call, diffs: event.call.diffs || t.diffs } : t,
-          ),
-        }));
+        patchAssistant(id, (m) => {
+          const toolCalls = (m.toolCalls || []).map((t) =>
+            t.id === event.call.id
+              ? { ...t, ...event.call, diffs: event.call.diffs || t.diffs }
+              : t,
+          );
+          // Keep a provisional edit summary so the card can appear as soon as the turn ends
+          const fromTools = editFilesFromTools(toolCalls);
+          const editSummary =
+            fromTools.length > 0
+              ? {
+                  ghostCommitId: m.editSummary?.ghostCommitId || `pending_${id}`,
+                  files: m.editSummary?.files?.length ? mergeEditFiles(m.editSummary.files, fromTools) : fromTools,
+                }
+              : m.editSummary;
+          return { ...m, toolCalls, editSummary };
+        });
         break;
       }
       case "plan": {
         const id = ensureAssistantMessage();
         patchAssistant(id, (m) => ({ ...m, plan: event.entries }));
+        if (event.entries?.length) {
+          setActivePlan((prev) => ({
+            path: prev?.path || "plan",
+            content:
+              prev?.content ||
+              event.entries.map((e, i) => `${i + 1}. ${e.content}`).join("\n"),
+            entries: event.entries,
+            updatedAt: Date.now(),
+          }));
+          setPlanDismissed(false);
+        }
+        break;
+      }
+      case "plan_document": {
+        setActivePlan(event.plan);
+        setPlanDismissed(false);
         break;
       }
       case "permission_request": {
@@ -390,39 +486,32 @@ export function App() {
           },
         }));
         setStatusLine(`Ghost · ${event.commit.fileCount} files snapshotted`);
-        // Attach per-turn edit summary to the live assistant message
+        // Attach per-turn edit summary to the live assistant message (must survive turn_done)
         const files =
           event.commit.files && event.commit.files.length > 0
             ? event.commit.files
             : (event.commit.paths || []).map((path) => ({ path, add: 0, del: 0 }));
-        const targetId = streamingId.current;
-        if (targetId && files.length > 0) {
-          patchAssistant(targetId, (m) => ({
-            ...m,
-            editSummary: {
-              ghostCommitId: event.commit.id,
-              files,
-            },
-          }));
-        } else if (files.length > 0) {
-          // Turn already closed streaming id — attach to last assistant message
-          setMessages((prev) => {
-            const next = [...prev];
+        const summary = {
+          ghostCommitId: event.commit.id,
+          files,
+        };
+        const targetId = streamingId.current || liveMessageId;
+        setMessages((prev) => {
+          const next = [...prev];
+          let idx = targetId ? next.findIndex((m) => m.id === targetId) : -1;
+          if (idx < 0) {
             for (let i = next.length - 1; i >= 0; i--) {
               if (next[i]?.role === "assistant") {
-                next[i] = {
-                  ...next[i]!,
-                  editSummary: {
-                    ghostCommitId: event.commit.id,
-                    files,
-                  },
-                };
+                idx = i;
                 break;
               }
             }
-            return next;
-          });
-        }
+          }
+          if (idx >= 0 && files.length > 0) {
+            next[idx] = { ...next[idx]!, editSummary: summary };
+          }
+          return next;
+        });
         break;
       }
       case "ghost_status":
@@ -459,11 +548,40 @@ export function App() {
           }));
         }
         if (event.ghost) setGhost(event.ghost);
-        if (streamingId.current && duration != null) {
-          const id = streamingId.current;
-          patchAssistant(id, (m) => ({ ...m, durationMs: duration }));
-        }
+        // Finalize assistant message: duration + ensure edit summary is visible immediately
+        const finishedId = streamingId.current || liveMessageId;
+        setMessages((prev) => {
+          const next = [...prev];
+          let idx = finishedId ? next.findIndex((m) => m.id === finishedId) : -1;
+          if (idx < 0) {
+            for (let i = next.length - 1; i >= 0; i--) {
+              if (next[i]?.role === "assistant") {
+                idx = i;
+                break;
+              }
+            }
+          }
+          if (idx < 0) return prev;
+          const m = next[idx]!;
+          let editSummary = m.editSummary;
+          if (!editSummary?.files?.length) {
+            const fromTools = editFilesFromTools(m.toolCalls);
+            if (fromTools.length) {
+              editSummary = {
+                ghostCommitId: event.ghost?.last?.id || m.editSummary?.ghostCommitId || `turn_${m.id}`,
+                files: fromTools,
+              };
+            }
+          }
+          next[idx] = {
+            ...m,
+            ...(duration != null ? { durationMs: duration } : {}),
+            ...(editSummary ? { editSummary } : {}),
+          };
+          return next;
+        });
         streamingId.current = null;
+        setLiveMessageId(null);
         setStatusLine(
           event.stopReason
             ? `Done · ${event.stopReason}${duration ? ` · ${formatDuration(duration)}` : ""}`
@@ -495,6 +613,86 @@ export function App() {
     setMode(m);
     setSettings((s) => ({ ...s, deckMode: m }));
     setStatusLine(`Mode: ${deckModeLabel(m)}`);
+    if (m === "plan") {
+      try {
+        const p = await window.grokDeck.agent.getPlan();
+        if (p) {
+          setActivePlan(p);
+          setPlanDismissed(false);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** Send a prompt without using the composer draft (plan implement / revise). */
+  async function sendAgentText(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed || busy) return;
+    if (auth.state !== "authenticated") {
+      setStatusLine("Sign in with Grok first");
+      return;
+    }
+    if (!project.root) {
+      setStatusLine("Open a project first");
+      return;
+    }
+    if (agentStatus.state === "idle" || agentStatus.state === "error") {
+      await window.grokDeck.agent.start(project.root);
+    }
+    setBusy(true);
+    streamingId.current = null;
+    setLiveMessageId(null);
+    turnStartRef.current = Date.now();
+    setLastTurnMs(null);
+    setMessages((prev) => [
+      ...prev,
+      { id: uid("u"), role: "user", content: trimmed, createdAt: Date.now() },
+    ]);
+    try {
+      await window.grokDeck.agent.prompt({ text: trimmed });
+    } catch (err) {
+      setBusy(false);
+      streamingId.current = null;
+      setLiveMessageId(null);
+      turnStartRef.current = null;
+      setStatusLine(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function onImplementPlan(notes: string) {
+    setPlanDismissed(true);
+    setStatusLine("계획 적용 · Normal 모드로 구현 시작");
+    await applyMode("normal");
+    const body = notes.trim()
+      ? [
+          "Approve and implement the plan as written.",
+          "Apply these adjustments from the user before/while implementing:",
+          "",
+          notes.trim(),
+          "",
+          "Start implementing now. Leave Plan mode and make the real code changes.",
+        ].join("\n")
+      : [
+          "Approve and implement the plan as written.",
+          "Start implementing now. Leave Plan mode and make the real code/file changes in the project.",
+        ].join("\n");
+    await sendAgentText(body);
+  }
+
+  async function onRevisePlan(notes: string) {
+    if (!notes.trim()) return;
+    setStatusLine("계획 수정 요청 (Plan 모드 유지)");
+    // Stay in plan mode so only plan.md can change
+    if (mode !== "plan") await applyMode("plan");
+    await sendAgentText(
+      [
+        "Revise the plan based on this user feedback. Update plan.md only — do not implement yet.",
+        "",
+        notes.trim(),
+      ].join("\n"),
+    );
   }
 
   async function cycleMode() {
@@ -521,6 +719,8 @@ export function App() {
       setSelectedDiff(null);
       setPermissionQueue([]);
       setActiveSession(null);
+      setActivePlan(null);
+      setPlanDismissed(false);
       streamingId.current = null;
       setStatusLine(state.root);
       await refreshSessions();
@@ -785,6 +985,7 @@ export function App() {
     setMentionOpen(false);
     setBusy(true);
     streamingId.current = null;
+    setLiveMessageId(null);
     turnStartRef.current = Date.now();
     setLastTurnMs(null);
     setMessages((prev) => [
@@ -810,6 +1011,8 @@ export function App() {
       });
     } catch (err) {
       setBusy(false);
+      streamingId.current = null;
+      setLiveMessageId(null);
       turnStartRef.current = null;
       setStatusLine(err instanceof Error ? err.message : String(err));
     }
@@ -1636,13 +1839,15 @@ export function App() {
               <MessageView
                 key={m.id}
                 message={m}
-                live={busy && m.id === streamingId.current}
+                live={busy && m.id === liveMessageId}
                 onReview={focusReview}
                 onUndo={() => void onGhostUndo()}
                 canUndo={
                   ghost.canUndo &&
                   !!m.editSummary &&
-                  ghost.last?.id === m.editSummary.ghostCommitId
+                  (!!ghost.last?.id
+                    ? ghost.last.id === m.editSummary.ghostCommitId
+                    : true)
                 }
                 undoing={undoing}
                 projectRoot={project.root}
@@ -1688,6 +1893,16 @@ export function App() {
               })}
             </div>
           </div>
+        ) : null}
+
+        {activePlan && !planDismissed && (mode === "plan" || mode === "normal") ? (
+          <PlanReviewCard
+            plan={activePlan}
+            busy={busy}
+            onImplement={(notes) => void onImplementPlan(notes)}
+            onRevise={(notes) => void onRevisePlan(notes)}
+            onDismiss={() => setPlanDismissed(true)}
+          />
         ) : null}
 
         <div className="composer-wrap">
@@ -1981,6 +2196,19 @@ export function App() {
         </div>
 
         <div className="right-scroll">
+          {(() => {
+            const steps =
+              activePlan?.entries?.length
+                ? activePlan.entries
+                : [...messages]
+                    .reverse()
+                    .find((m) => m.role === "assistant" && m.plan?.length)?.plan;
+            return steps?.length ? (
+              <div className="right-section">
+                <PlanStepsPanel entries={steps} title="현재 작업 단계" />
+              </div>
+            ) : null;
+          })()}
           <div className="right-section">
             <h4>리뷰 · Diff</h4>
             {fileList.length === 0 ? (
@@ -2170,8 +2398,11 @@ function MessageView({
       ) : null}
 
       {message.plan?.length ? (
-        <div className="plan-box">
-          <strong>Plan</strong>
+        <details className="plan-box" open>
+          <summary>
+            <strong>Plan</strong>
+            <span className="plan-box-meta">{message.plan.length} steps · 펼치기/접기</span>
+          </summary>
           <ol>
             {message.plan.map((p, i) => (
               <li key={i}>
@@ -2180,17 +2411,11 @@ function MessageView({
               </li>
             ))}
           </ol>
-        </div>
+        </details>
       ) : null}
 
-      {/* Live tools as compact chips (Codex-style) */}
-      {live && tools.length > 0 ? (
-        <div className="live-tools">
-          {tools.map((t) => (
-            <ToolChip key={t.id} tool={t} />
-          ))}
-        </div>
-      ) : null}
+      {/* Live tools: collapsed toast so assistant text stays visible */}
+      {live && tools.length > 0 ? <LiveToolToast tools={tools} /> : null}
 
       {/* Finished turn: per-message file edit summary + collapsed other tools */}
       {!live ? (
@@ -2198,7 +2423,11 @@ function MessageView({
           {hasEdits ? (
             <EditSummaryCard
               tools={editTools}
-              files={editSummary?.files}
+              files={
+                editSummary?.files?.length
+                  ? editSummary.files
+                  : editFilesFromTools(tools)
+              }
               onReview={onReview}
               onUndo={onUndo}
               canUndo={canUndo}
@@ -2207,6 +2436,10 @@ function MessageView({
           ) : null}
           {otherTools.length > 0 ? (
             <ToolGroup tools={otherTools} defaultCollapsed />
+          ) : null}
+          {/* Safety: if only edit tools with no summary classification, still show group collapsed */}
+          {!hasEdits && editTools.length > 0 ? (
+            <ToolGroup tools={editTools} label="파일 편집" defaultCollapsed />
           ) : null}
         </>
       ) : null}

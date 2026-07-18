@@ -8,6 +8,8 @@ import type {
   DeckMode,
   FileDiff,
   PermissionOption,
+  PlanDocument,
+  PlanEntry,
   StreamEvent,
   TokenUsage,
   ToolCallView,
@@ -86,6 +88,8 @@ export class GrokAcpClient extends EventEmitter {
   private ghost: GhostGit;
   private availableCommands: Array<{ name: string; description: string; hint?: string }> = [];
   private reasoningEffort: "low" | "medium" | "high";
+  /** Latest plan.md (or ACP plan entries) for Codex-style review UI */
+  private lastPlan: PlanDocument | null = null;
 
   constructor(private readonly options: AcpClientOptions) {
     super();
@@ -103,6 +107,10 @@ export class GrokAcpClient extends EventEmitter {
 
   getCommands() {
     return this.availableCommands;
+  }
+
+  getLastPlan(): PlanDocument | null {
+    return this.lastPlan;
   }
 
   getReasoningEffort() {
@@ -281,7 +289,7 @@ export class GrokAcpClient extends EventEmitter {
       clientInfo: {
         name: "grok-deck",
         title: "Grok Deck",
-        version: "0.3.0",
+        version: "0.4.2",
       },
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
@@ -646,15 +654,26 @@ export class GrokAcpClient extends EventEmitter {
         break;
       }
       case "plan": {
-        const entries = (update.entries as Array<Record<string, unknown>> | undefined) || [];
-        this.emitEvent({
-          type: "plan",
-          entries: entries.map((e) => ({
-            content: String(e.content ?? e.title ?? ""),
-            status: e.status != null ? String(e.status) : undefined,
-            priority: e.priority != null ? String(e.priority) : undefined,
-          })),
-        });
+        const entries: PlanEntry[] = (
+          (update.entries as Array<Record<string, unknown>> | undefined) || []
+        ).map((e) => ({
+          content: String(e.content ?? e.title ?? ""),
+          status: e.status != null ? String(e.status) : undefined,
+          priority: e.priority != null ? String(e.priority) : undefined,
+        }));
+        this.emitEvent({ type: "plan", entries });
+        // Surface as reviewable plan even before plan.md lands
+        if (entries.length > 0) {
+          const content =
+            this.lastPlan?.content ||
+            entries.map((e, i) => `${i + 1}. ${e.content}`).join("\n");
+          this.publishPlan({
+            path: this.lastPlan?.path || "plan",
+            content,
+            entries,
+            updatedAt: Date.now(),
+          });
+        }
         break;
       }
       case "available_commands_update": {
@@ -779,10 +798,13 @@ export class GrokAcpClient extends EventEmitter {
       return;
     }
 
-    // Plan: allow tools that only touch session plan.md; block other mutations.
-    // The official agent keeps the plan outside the workspace under ~/.grok/sessions.
-    if (this.mode === "plan" && isMutatingTool(toolCall)) {
-      if (isPlanFileTool(toolCall)) {
+    // Plan mode: auto-allow plan.md edits, plan approval, and non-mutating tools.
+    // Reject only true project mutations (code edits, shell, etc.).
+    if (this.mode === "plan") {
+      const mutating = isMutatingTool(toolCall);
+      const planOnly =
+        !mutating || isPlanFileTool(toolCall) || isPlanApprovalPermission(toolCall, options);
+      if (planOnly) {
         const allow = pickAllowOption(options, true);
         this.send({
           jsonrpc: "2.0",
@@ -799,7 +821,8 @@ export class GrokAcpClient extends EventEmitter {
       });
       this.emitEvent({
         type: "status",
-        message: "Plan mode blocked a project edit — only plan.md is writable (Shift+Tab to leave Plan)",
+        message:
+          "Plan mode blocked a project edit - only plan.md is writable (Shift+Tab to leave Plan)",
       });
       return;
     }
@@ -846,20 +869,26 @@ export class GrokAcpClient extends EventEmitter {
     if (!p.path) throw new Error("fs/write_text_file: missing path");
     if (typeof p.content !== "string") throw new Error("fs/write_text_file: missing content");
 
-    // Allows workspace paths + session plan.md under ~/.grok/sessions
+    // Workspace paths + any plan.md (session store under ~/.grok/sessions, or workspace fallback)
     const abs = this.resolveAllowedPath(p.path);
-    const planFile = isGrokSessionPlanPath(abs);
+    const planFile = isPlanMarkdownPath(abs);
 
-    // Plan mode: only the official session plan.md may be written.
-    // Always-approve is NOT required — plan.md is the whole point of Plan mode.
+    // Plan mode: only files named plan.md may be written.
+    // Always-approve is NOT required - writing the plan is the point of Plan mode.
     if (this.mode === "plan" && !planFile) {
       throw new Error(
-        "Plan mode: project file writes are blocked. Only the session plan.md is writable. Shift+Tab to Normal or Always-approve.",
+        "Plan mode: project file writes are blocked. Only plan.md is writable. Shift+Tab to Normal or Always-approve.",
       );
     }
 
-    // Session plan.md: auto-write (no permission prompt, no Ghost Git — not project files)
+    // plan.md: auto-write (no permission prompt, no Ghost Git)
     if (planFile) {
+      let previous: string | null = null;
+      try {
+        previous = await readFile(abs, "utf8");
+      } catch {
+        previous = null;
+      }
       await mkdir(dirname(abs), { recursive: true });
       await writeFile(abs, p.content, "utf8");
       this.emitEvent({
@@ -870,11 +899,17 @@ export class GrokAcpClient extends EventEmitter {
       });
       this.emitEvent({
         type: "diff",
-        diff: { path: abs, oldText: null, newText: p.content },
+        diff: { path: abs, oldText: previous, newText: p.content },
+      });
+      this.publishPlan({
+        path: abs,
+        content: p.content,
+        entries: this.lastPlan?.entries,
+        updatedAt: Date.now(),
       });
       this.emitEvent({
         type: "status",
-        message: "Plan file updated",
+        message: "Plan ready for review",
       });
       return null;
     }
@@ -981,6 +1016,11 @@ export class GrokAcpClient extends EventEmitter {
     });
   }
 
+  private publishPlan(plan: PlanDocument) {
+    this.lastPlan = plan;
+    this.emitEvent({ type: "plan_document", plan });
+  }
+
   /**
    * Resolve a path the agent may read/write:
    * - project workspace (path jail)
@@ -1072,14 +1112,17 @@ function pickRejectOption(options: PermissionOption[]): string {
 }
 
 function isMutatingTool(toolCall?: ToolCallView): boolean {
-  if (!toolCall) return true;
+  // No tool metadata -> treat as non-mutating so plan-approval RPCs are not auto-rejected
+  if (!toolCall) return false;
   const kind = (toolCall.kind || "").toLowerCase();
   if (["edit", "delete", "move", "execute"].includes(kind)) return true;
   const title = `${toolCall.title || ""} ${toolCall.tool || ""}`.toLowerCase();
-  return /write|edit|delete|shell|bash|run_terminal|search_replace|apply_patch/.test(title);
+  return /write|edit|delete|shell|bash|run_terminal|search_replace|apply_patch|str_replace|create_file/.test(
+    title,
+  );
 }
 
-/** Official agent plan file: ~/.grok/sessions/<encoded-cwd>/<session-id>/plan.md */
+/** Official agent plan store: ~/.grok/sessions/<encoded-cwd>/<session-id>/plan.md */
 function grokSessionsRoot(): string {
   return resolve(join(homedir(), ".grok", "sessions"));
 }
@@ -1095,15 +1138,22 @@ function isUnderDir(abs: string, root: string): boolean {
   return aLower.startsWith(prefix) || aLower === rLower;
 }
 
+/** Any path whose basename is plan.md (workspace fallback or session store). */
+export function isPlanMarkdownPath(filePath: string): boolean {
+  try {
+    return basename(resolve(filePath)).toLowerCase() === "plan.md";
+  } catch {
+    return false;
+  }
+}
+
 /**
- * True for the session plan document the agent is allowed to edit in Plan mode.
- * Only `plan.md` under ~/.grok/sessions — not arbitrary files outside the workspace.
+ * plan.md under ~/.grok/sessions - allowed outside the workspace path jail.
  */
 export function isGrokSessionPlanPath(filePath: string): boolean {
   try {
     const abs = resolve(filePath);
-    const name = basename(abs).toLowerCase();
-    if (name !== "plan.md") return false;
+    if (!isPlanMarkdownPath(abs)) return false;
     return isUnderDir(abs, grokSessionsRoot());
   } catch {
     return false;
@@ -1122,41 +1172,51 @@ function toolCallPaths(toolCall?: ToolCallView): string[] {
   }
   const fromInput = extractPathFromInput(toolCall.input);
   if (fromInput) out.push(fromInput);
-  // raw input sometimes nests path under different keys / JSON string
   if (typeof toolCall.input === "string") {
-    const m = toolCall.input.match(/[A-Za-z]:\\[^"'\n]+plan\.md|\/[^\s"']+plan\.md/i);
+    const m = toolCall.input.match(
+      /(?:[A-Za-z]:\\|\/)[^\s"'<>|*?]+plan\.md|[^\s"'<>|*?]+[/\\]plan\.md/i,
+    );
     if (m?.[0]) out.push(m[0]);
   }
   return out;
 }
 
 /**
- * Mutating tool that only targets session plan.md — safe to auto-allow in Plan mode.
- * If we cannot determine paths, return false (reject / ask rather than open the jail).
+ * Mutating tool that only targets plan.md - safe to auto-allow in Plan mode.
+ * Covers both ~/.grok/sessions/.../plan.md and workspace .../<sessionId>/plan.md.
  */
 function isPlanFileTool(toolCall?: ToolCallView): boolean {
   if (!toolCall) return false;
   const paths = toolCallPaths(toolCall);
   if (paths.length === 0) {
-    // Heuristic: titles like "Update plan" / tools named plan without a path
     const label = `${toolCall.title || ""} ${toolCall.tool || ""} ${toolCall.kind || ""}`.toLowerCase();
-    if (/\bplan\b/.test(label) && !/search_replace|write_file|apply_patch|edit_file/.test(label)) {
+    if (
+      /\bplan\.md\b/.test(label) ||
+      (/\bplan\b/.test(label) && !/shell|terminal|bash|execute/.test(label))
+    ) {
       return true;
     }
     return false;
   }
-  return paths.every((p) => {
-    try {
-      const abs = resolve(isAbsolute(p) ? p : p);
-      // relative paths named plan.md are NOT session plans (workspace)
-      if (!isAbsolute(p) && basename(p).toLowerCase() === "plan.md" && !p.includes(".grok")) {
-        return false;
-      }
-      return isGrokSessionPlanPath(abs) || (basename(abs).toLowerCase() === "plan.md" && /[/\\]\.grok[/\\]sessions[/\\]/i.test(abs));
-    } catch {
-      return false;
-    }
-  });
+  return paths.every((p) => isPlanMarkdownPath(p) || /(?:^|[/\\])plan\.md$/i.test(p.trim()));
+}
+
+/** Agent "approve plan" / exit-plan-mode style permission (no file path). */
+function isPlanApprovalPermission(
+  toolCall: ToolCallView | undefined,
+  options: PermissionOption[],
+): boolean {
+  const label = `${toolCall?.title || ""} ${toolCall?.tool || ""} ${toolCall?.kind || ""}`.toLowerCase();
+  if (/\bplan\b/.test(label) && !isMutatingTool(toolCall)) return true;
+  const optText = options
+    .map((o) => `${o.optionId} ${o.name} ${o.kind || ""}`)
+    .join(" ")
+    .toLowerCase();
+  if (/approve.*plan|plan.*approv|exit.?plan|accept.?plan|implement.?plan/.test(optText)) {
+    return true;
+  }
+  if (/approve.*plan|plan.*approv|exit.?plan|accept.?plan/.test(label)) return true;
+  return false;
 }
 
 function summarizeTool(toolCall?: ToolCallView): string | undefined {

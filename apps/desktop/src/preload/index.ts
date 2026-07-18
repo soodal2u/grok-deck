@@ -8,6 +8,7 @@ import {
   type ChatMessage,
   type DeckMode,
   type GhostStatus,
+  type PlanDocument,
   type OpenExternalTarget,
   type ProjectGroup,
   type ProjectState,
@@ -85,6 +86,8 @@ const api = {
       ipcRenderer.invoke(IpcChannels.agentSetEffort, effort),
     getCommands: (): Promise<SlashCommand[]> =>
       ipcRenderer.invoke(IpcChannels.agentGetCommands),
+    getPlan: (): Promise<PlanDocument | null> =>
+      ipcRenderer.invoke(IpcChannels.agentGetPlan),
     getStatus: (): Promise<AgentRuntimeStatus> => ipcRenderer.invoke(IpcChannels.agentStatus),
     onEvent: (handler: (event: StreamEvent) => void) => {
       const listener = (_: Electron.IpcRendererEvent, event: StreamEvent) => handler(event);

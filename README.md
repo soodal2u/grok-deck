@@ -50,7 +50,7 @@ Cycle with **Shift+Tab**. Toggle Always-approve with **Ctrl+O**.
 | Mode | Shortcut | Behavior |
 |---|---|---|
 | **Normal** | Shift+Tab cycle | Ask before file writes & risky tools |
-| **Plan** | Shift+Tab cycle | Plan only — **project writes blocked**; session `plan.md` (`~/.grok/sessions/...`) is writable |
+| **Plan** | Shift+Tab cycle | Plan only — **project writes blocked**; `plan.md` writable; **review card** to expand / note changes / implement |
 | **Always-approve** | Shift+Tab / **Ctrl+O** | Auto-approve tools & edits (use carefully) |
 
 Permission requests are **queued** (not lost if several fire). Write approvals show a **diff preview** before applying.

@@ -369,6 +369,8 @@ function registerIpc() {
 
   ipcMain.handle(IpcChannels.agentStatus, async () => agent.getStatus());
 
+  ipcMain.handle(IpcChannels.agentGetPlan, async () => agent.getLastPlan());
+
   ipcMain.handle(IpcChannels.agentGetCommands, async () => {
     const remote = agent.getCommands();
     const project = await loadProjectState();

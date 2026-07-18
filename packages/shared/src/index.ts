@@ -32,7 +32,7 @@ export function deckModeHint(mode: DeckMode): string {
     case "normal":
       return "Ask before edits & shell (Shift+Tab to cycle)";
     case "plan":
-      return "Plan only — project writes blocked; plan.md allowed (Shift+Tab)";
+      return "Plan only — project writes blocked; any plan.md allowed (Shift+Tab)";
     case "yolo":
       return "Auto-approve tools (Shift+Tab / Ctrl+O)";
   }
@@ -111,6 +111,14 @@ export interface PlanEntry {
   content: string;
   status?: string;
   priority?: string;
+}
+
+/** Latest plan document the UI can review / implement (Codex-style). */
+export interface PlanDocument {
+  path: string;
+  content: string;
+  entries?: PlanEntry[];
+  updatedAt: number;
 }
 
 export type PermissionSource = "agent" | "client_fs" | "client_shell";
@@ -214,6 +222,7 @@ export type StreamEvent =
   | { type: "tool_call"; call: ToolCallView }
   | { type: "tool_call_update"; call: Partial<ToolCallView> & { id: string } }
   | { type: "plan"; entries: PlanEntry[] }
+  | { type: "plan_document"; plan: PlanDocument }
   | {
       type: "permission_request";
       requestId: number;
@@ -369,6 +378,7 @@ export const IpcChannels = {
   agentLoadSession: "agent:load-session",
   agentSetEffort: "agent:set-effort",
   agentGetCommands: "agent:get-commands",
+  agentGetPlan: "agent:get-plan",
   agentEvent: "agent:event",
   agentStatus: "agent:status",
   ghostUndo: "ghost:undo",

@@ -203,6 +203,10 @@ export class AgentManager {
     return this.client?.getCommands() ?? [];
   }
 
+  getLastPlan() {
+    return this.client?.getLastPlan() ?? null;
+  }
+
   /**
    * Apply reasoning effort by restarting the agent process in the same cwd.
    * Grok agent picks effort via --reasoning-effort at start.
