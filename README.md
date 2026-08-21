@@ -169,7 +169,7 @@ npm run dist                 # Windows Setup + portable → apps/desktop/release
 
 ### License
 
-Published publicly on GitHub. Add a `LICENSE` file if you want an explicit open-source license.
+[MIT](LICENSE). You may use, copy, modify, and distribute this software — including commercially — as long as you keep the copyright notice and license text (attribution).
 
 ---
 
@@ -368,4 +368,4 @@ npm run dist                 # Setup + portable → apps/desktop/release/
 
 ### 라이선스
 
-GitHub에 공개되어 있습니다. 명시적 오픈소스 라이선스가 필요하면 `LICENSE` 파일을 추가하세요.
+[MIT](LICENSE). 저작권 표시와 라이선스 문구(출처)만 유지하면 상업적 이용을 포함해 자유롭게 사용·복사·수정·배포할 수 있습니다.

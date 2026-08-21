@@ -2,6 +2,7 @@
   "name": "grok-deck",
   "version": "0.5.4",
   "private": true,
+  "license": "MIT",
   "description": "Grok Deck desktop command center for Grok agents",
   "main": "./out/main/index.js",
   "author": "Grok Deck",
