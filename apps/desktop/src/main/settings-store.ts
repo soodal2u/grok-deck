@@ -75,6 +75,12 @@ function migrateSettings(parsed: Partial<AppSettings> & {
       parsed.sidebarExpanded && typeof parsed.sidebarExpanded === "object"
         ? parsed.sidebarExpanded
         : DEFAULT_SETTINGS.sidebarExpanded,
+    notifyMessage:
+      typeof parsed.notifyMessage === "boolean"
+        ? parsed.notifyMessage
+        : DEFAULT_SETTINGS.notifyMessage,
+    notifySound:
+      typeof parsed.notifySound === "boolean" ? parsed.notifySound : DEFAULT_SETTINGS.notifySound,
   };
   if (!parsed.deckMode && parsed.alwaysApprove) migrated.deckMode = "yolo";
   if (!parsed.deckMode && parsed.permissionMode === "plan") migrated.deckMode = "plan";

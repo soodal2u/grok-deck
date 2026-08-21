@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, net, protocol, screen, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, net, Notification, protocol, screen, shell } from "electron";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -72,6 +72,10 @@ protocol.registerSchemesAsPrivileged([
     },
   },
 ]);
+
+if (process.platform === "win32") {
+  app.setAppUserModelId("app.grokdeck.desktop");
+}
 
 let mainWindow: BrowserWindow | null = null;
 const agent = new AgentManager(() => mainWindow);
@@ -233,8 +237,41 @@ async function createWindow() {
   }
 }
 
+function showTurnNotification(payload: {
+  title?: string;
+  body?: string;
+  silent?: boolean;
+  force?: boolean;
+}): { ok: boolean; skipped?: string } {
+  if (!Notification.isSupported()) return { ok: false, skipped: "unsupported" };
+  const focused = Boolean(mainWindow?.isFocused() && !mainWindow.isMinimized());
+  if (focused && !payload.force) return { ok: true, skipped: "focused" };
+  const n = new Notification({
+    title: payload.title?.trim() || "Grok Deck",
+    body: payload.body?.trim() || "작업이 끝났습니다",
+    icon: resolveIcon(),
+    silent: Boolean(payload.silent),
+  });
+  n.on("click", () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+  n.show();
+  return { ok: true };
+}
+
 function registerIpc() {
   ipcMain.handle(IpcChannels.appGetVersion, () => app.getVersion());
+
+  ipcMain.handle(
+    IpcChannels.appNotify,
+    (
+      _e,
+      payload?: { title?: string; body?: string; silent?: boolean; force?: boolean },
+    ) => showTurnNotification(payload || {}),
+  );
 
   ipcMain.handle(IpcChannels.authGetStatus, async () => getAuthStatus());
 

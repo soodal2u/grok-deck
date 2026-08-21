@@ -362,6 +362,10 @@ export interface AppSettings {
   projectOrder?: string[];
   /** Sidebar project expand state keyed by cwd. Missing key = expanded. */
   sidebarExpanded?: Record<string, boolean>;
+  /** Windows toast when a turn finishes (and the window is in the background). */
+  notifyMessage?: boolean;
+  /** Play a chime when a turn finishes. */
+  notifySound?: boolean;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -375,6 +379,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   rightWidth: 300,
   projectOrder: [],
   sidebarExpanded: {},
+  notifyMessage: true,
+  notifySound: true,
 };
 
 export const PANEL_LIMITS = {
@@ -399,6 +405,7 @@ export const BUILTIN_SLASH: SlashCommand[] = [
 
 export const IpcChannels = {
   appGetVersion: "app:get-version",
+  appNotify: "app:notify",
   authGetStatus: "auth:get-status",
   authLogin: "auth:login",
   authLogout: "auth:logout",

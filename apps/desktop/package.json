@@ -1,6 +1,6 @@
 {
   "name": "grok-deck",
-  "version": "0.5.5",
+  "version": "0.6.0",
   "private": true,
   "license": "MIT",
   "description": "Grok Deck desktop command center for Grok agents",

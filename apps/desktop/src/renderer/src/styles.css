@@ -418,6 +418,38 @@ button {
   margin: 8px 0;
 }
 
+.settings-notify {
+  margin: 12px 0 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+}
+
+.settings-notify h4 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.settings-notify .check-row {
+  margin: 6px 0 0;
+  width: 100%;
+}
+
+.notify-hint {
+  margin: 2px 0 6px 22px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.notify-preview {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
 .ai-theme-input {
   width: 100%;
   border: 1px solid var(--border);

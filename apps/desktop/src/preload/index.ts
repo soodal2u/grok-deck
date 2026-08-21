@@ -27,6 +27,13 @@ import {
 const api = {
   app: {
     getVersion: (): Promise<string> => ipcRenderer.invoke(IpcChannels.appGetVersion),
+    notify: (payload: {
+      title?: string;
+      body?: string;
+      silent?: boolean;
+      force?: boolean;
+    }): Promise<{ ok: boolean; skipped?: string }> =>
+      ipcRenderer.invoke(IpcChannels.appNotify, payload),
   },
   auth: {
     getStatus: (): Promise<AuthStatus> => ipcRenderer.invoke(IpcChannels.authGetStatus),

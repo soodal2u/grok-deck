@@ -46,6 +46,7 @@ import {
   isCustomThemeId,
 } from "@grok-deck/shared";
 import { closeOpenFences } from "./path-links";
+import { playDoneChime } from "./done-chime";
 import { Markdown } from "./components/Markdown";
 import { ToolChip, ToolGroup } from "./components/ToolChip";
 import { EditSummaryCard } from "./components/EditSummaryCard";
@@ -291,6 +292,7 @@ export function App() {
   const liveIdRef = useRef<string | null>(null);
   const sessionRef = useRef<SessionSummary | null>(null);
   const projectRef = useRef<ProjectState>({ root: null, recent: [] });
+  const settingsRef = useRef<AppSettings>(settings);
   const submitRef = useRef<(text: string, atts: ChatAttachment[]) => void>(() => undefined);
 
   const scrollChatToBottom = useCallback((force = false) => {
@@ -653,6 +655,35 @@ export function App() {
     }
   }
 
+  function notifyTurnFinished(args: {
+    onActive: boolean;
+    durationMs?: number;
+    stopReason?: string;
+  }) {
+    if (args.stopReason === "cancelled") return;
+    const s = settingsRef.current;
+    const wantMsg = s.notifyMessage !== false;
+    const wantSound = s.notifySound !== false;
+    if (!wantMsg && !wantSound) return;
+    if (wantSound) void playDoneChime();
+    if (!wantMsg) return;
+    const dur = args.durationMs != null ? formatDuration(args.durationMs) : "";
+    const title = args.onActive ? sessionRef.current?.title || "Grok Deck" : "Grok Deck";
+    const body = args.onActive
+      ? dur
+        ? `작업이 끝났습니다 · ${dur}`
+        : "작업이 끝났습니다"
+      : dur
+        ? `다른 스레드 작업이 끝났습니다 · ${dur}`
+        : "다른 스레드 작업이 끝났습니다";
+    void window.grokDeck.app.notify({
+      title,
+      body,
+      silent: wantSound,
+      force: !args.onActive,
+    });
+  }
+
   function handleStreamEvent(event: StreamEvent) {
     const key = eventThreadKey(event);
     switch (event.type) {
@@ -965,6 +996,21 @@ export function App() {
             window.setTimeout(() => {
               if (nxt?.text) void submitRef.current(nxt.text, []);
             }, 80);
+          } else {
+            notifyTurnFinished({
+              onActive: true,
+              durationMs: duration,
+              stopReason: event.stopReason,
+            });
+          }
+        } else {
+          const rest = cacheRef.current[key]?.queue || [];
+          if (!rest.length) {
+            notifyTurnFinished({
+              onActive: false,
+              durationMs: duration,
+              stopReason: event.stopReason,
+            });
           }
         }
         void refreshSessions();
@@ -1882,6 +1928,7 @@ export function App() {
   liveIdRef.current = liveMessageId;
   sessionRef.current = activeSession;
   projectRef.current = project;
+  settingsRef.current = settings;
 
   const estimatedTokens = useMemo(() => estimateTranscriptTokens(messages), [messages]);
 
@@ -2049,6 +2096,45 @@ export function App() {
                       onChange={(e) => setSettings({ ...settings, grokPath: e.target.value })}
                       onBlur={() => void saveSettingsLocal(settings)}
                     />
+                  </div>
+                  <div className="settings-notify">
+                    <h4>알림</h4>
+                    <p className="muted" style={{ margin: "0 0 8px" }}>
+                      대화나 작업이 끝나면 알려줍니다. 각각 따로 켤 수 있습니다.
+                    </p>
+                    <label className="check-row">
+                      <input
+                        type="checkbox"
+                        checked={settings.notifyMessage !== false}
+                        onChange={(e) => {
+                          const next = { ...settings, notifyMessage: e.target.checked };
+                          setSettings(next);
+                          void saveSettingsLocal(next);
+                        }}
+                      />
+                      메시지 알림
+                    </label>
+                    <p className="muted notify-hint">창이 뒤에 있거나 다른 스레드가 끝나면 Windows 알림</p>
+                    <label className="check-row">
+                      <input
+                        type="checkbox"
+                        checked={settings.notifySound !== false}
+                        onChange={(e) => {
+                          const next = { ...settings, notifySound: e.target.checked };
+                          setSettings(next);
+                          void saveSettingsLocal(next);
+                        }}
+                      />
+                      소리 알림
+                      <button
+                        type="button"
+                        className="btn btn-sm notify-preview"
+                        onClick={() => void playDoneChime()}
+                      >
+                        미리듣기
+                      </button>
+                    </label>
+                    <p className="muted notify-hint">작업이 끝나면 차임을 재생합니다</p>
                   </div>
                   <label className="check-row">
                     <input
