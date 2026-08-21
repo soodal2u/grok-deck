@@ -30,9 +30,18 @@ export function looksLikePath(raw: string): boolean {
   return false;
 }
 
+/** Close an unmatched opening ``` so leftover fences cannot swallow later text. */
+export function closeOpenFences(text: string): string {
+  if (!text) return text;
+  const ticks = text.match(/^ {0,3}```/gm);
+  if (!ticks || ticks.length % 2 === 0) return text;
+  return `${text.replace(/\s*$/, "")}\n\`\`\`\n`;
+}
+
 export function prepareMarkdownPaths(text: string): string {
   if (!text) return text;
-  let s = joinSplitWindowsPaths(text);
+  let s = closeOpenFences(text);
+  s = joinSplitWindowsPaths(s);
   s = mapOutsideFences(s, rewriteExistingPathLinks);
   s = mapOutsideFences(s, linkifyBarePaths);
   return s;

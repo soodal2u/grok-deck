@@ -45,6 +45,7 @@ import {
   customThemeKey,
   isCustomThemeId,
 } from "@grok-deck/shared";
+import { closeOpenFences } from "./path-links";
 import { Markdown } from "./components/Markdown";
 import { ToolChip, ToolGroup } from "./components/ToolChip";
 import { EditSummaryCard } from "./components/EditSummaryCard";
@@ -569,10 +570,48 @@ export function App() {
     return idx > 0 ? key.slice(0, idx) : "";
   }
 
+  function threadMessages(k: string): ChatMessage[] {
+    if (k === activeThreadKey()) return messagesRef.current;
+    return cacheRef.current[k]?.messages || [];
+  }
+
+  /** New user turn: never reuse the previous assistant bubble for the next reply. */
+  function beginUserTurn() {
+    const key = activeThreadKey();
+    if (key) streamingByKey.current[key] = null;
+    streamingId.current = null;
+    setLiveMessageId(null);
+    liveIdRef.current = null;
+    setBusy(true);
+    busyRef.current = true;
+    turnStartRef.current = Date.now();
+    setLastTurnMs(null);
+    stickToBottomRef.current = true;
+    usageBaselineRef.current = officialUsed(usageRef.current);
+  }
+
   function ensureAssistantMessage(key?: string): string {
     const k = key || activeThreadKey();
     const existing = streamingByKey.current[k] || (k === activeThreadKey() ? streamingId.current : null);
-    if (existing) return existing;
+    if (existing) {
+      const msgs = threadMessages(k);
+      const aIdx = msgs.findIndex((m) => m.id === existing);
+      let lastUser = -1;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i]?.role === "user") {
+          lastUser = i;
+          break;
+        }
+      }
+      // Only reuse if this bubble is the reply sitting after the latest user message
+      if (aIdx >= 0 && aIdx > lastUser) return existing;
+      if (aIdx >= 0 && aIdx <= lastUser) {
+        const stale = msgs[aIdx];
+        if (stale?.content) {
+          patchAssistant(existing, (m) => ({ ...m, content: closeOpenFences(m.content) }), k);
+        }
+      }
+    }
     const id = uid("a");
     streamingByKey.current[k] = id;
     if (k === activeThreadKey()) {
@@ -822,10 +861,16 @@ export function App() {
           cancelTimerRef.current = null;
         }
         const onActive = key === activeThreadKey();
+        const finishedId =
+          streamingByKey.current[key] ||
+          (onActive ? streamingId.current || liveIdRef.current : cacheRef.current[key]?.liveMessageId);
         streamingByKey.current[key] = null;
         if (onActive) {
           setBusy(false);
           busyRef.current = false;
+          streamingId.current = null;
+          setLiveMessageId(null);
+          liveIdRef.current = null;
         }
         touchCache(key, { busy: false, liveMessageId: null });
         persistNow(key);
@@ -845,17 +890,29 @@ export function App() {
           }));
         }
         if (onActive && event.ghost) setGhost(event.ghost);
-        const finishedId =
-          streamingByKey.current[key] ||
-          (onActive ? streamingId.current || liveIdRef.current : cacheRef.current[key]?.liveMessageId);
         const finalize = (prev: ChatMessage[]) => {
           const next = [...prev];
           let idx = finishedId ? next.findIndex((m) => m.id === finishedId) : -1;
           if (idx < 0) {
+            let lastUser = -1;
             for (let i = next.length - 1; i >= 0; i--) {
-              if (next[i]?.role === "assistant") {
+              if (next[i]?.role === "user") {
+                lastUser = i;
+                break;
+              }
+            }
+            for (let i = next.length - 1; i >= 0; i--) {
+              if (next[i]?.role === "assistant" && i > lastUser) {
                 idx = i;
                 break;
+              }
+            }
+            if (idx < 0) {
+              for (let i = (lastUser > 0 ? lastUser : next.length) - 1; i >= 0; i--) {
+                if (next[i]?.role === "assistant") {
+                  idx = i;
+                  break;
+                }
               }
             }
           }
@@ -873,6 +930,7 @@ export function App() {
           }
           next[idx] = {
             ...m,
+            content: closeOpenFences(m.content),
             ...(duration != null ? { durationMs: duration } : {}),
             ...(editSummary ? { editSummary } : {}),
           };
@@ -885,8 +943,6 @@ export function App() {
             touchCache(key, { messages: next, busy: false, liveMessageId: null });
             return next;
           });
-          streamingId.current = null;
-          setLiveMessageId(null);
         } else {
           const prev = cacheRef.current[key]?.messages || [];
           touchCache(key, { messages: finalize(prev), busy: false, liveMessageId: null });
@@ -916,11 +972,14 @@ export function App() {
         break;
       }
       case "error":
+        streamingByKey.current[key] = null;
         if (key === activeThreadKey()) {
           setBusy(false);
+          busyRef.current = false;
           streamingId.current = null;
+          setLiveMessageId(null);
         }
-        touchCache(key, { busy: false });
+        touchCache(key, { busy: false, liveMessageId: null });
         persistNow(key);
         setStatusLine(event.message);
         setMessages((prev) => [
@@ -967,20 +1026,23 @@ export function App() {
     if (agentStatus.state === "idle" || agentStatus.state === "error") {
       await window.grokDeck.agent.start(project.root);
     }
-    stickToBottomRef.current = true;
-    usageBaselineRef.current = officialUsed(usageRef.current);
-    setBusy(true);
-    streamingId.current = null;
-    setLiveMessageId(null);
-    turnStartRef.current = Date.now();
-    setLastTurnMs(null);
-    setMessages((prev) => [
-      ...prev,
-      { id: uid("u"), role: "user", content: trimmed, createdAt: Date.now() },
-    ]);
+    beginUserTurn();
+    const userMsg: ChatMessage = {
+      id: uid("u"),
+      role: "user",
+      content: trimmed,
+      createdAt: Date.now(),
+    };
+    const nextMsgs = [...messagesRef.current, userMsg];
+    messagesRef.current = nextMsgs;
+    setMessages(nextMsgs);
+    const key = activeThreadKey();
+    if (key) touchCache(key, { messages: nextMsgs, busy: true });
     try {
       await window.grokDeck.agent.prompt({ text: trimmed });
     } catch (err) {
+      const k = activeThreadKey();
+      if (k) streamingByKey.current[k] = null;
       setBusy(false);
       busyRef.current = false;
       streamingId.current = null;
@@ -1272,7 +1334,7 @@ export function App() {
 
   async function handleSubmit(text: string, pendingAtts: ChatAttachment[]) {
     const trimmed = text.trim();
-    if ((!trimmed && pendingAtts.length === 0) || busy) return;
+    if ((!trimmed && pendingAtts.length === 0) || busyRef.current) return;
     if (auth.state !== "authenticated") {
       setStatusLine("Sign in with Grok first");
       return;
@@ -1311,14 +1373,7 @@ export function App() {
     }
 
     const displayText = trimmed || (pendingAtts.length ? `(첨부 ${pendingAtts.length}개)` : "");
-    stickToBottomRef.current = true;
-    usageBaselineRef.current = officialUsed(usageRef.current);
-    setBusy(true);
-    busyRef.current = true;
-    streamingId.current = null;
-    setLiveMessageId(null);
-    turnStartRef.current = Date.now();
-    setLastTurnMs(null);
+    beginUserTurn();
     const userMsg: ChatMessage = {
       id: uid("u"),
       role: "user",
@@ -1326,16 +1381,14 @@ export function App() {
       createdAt: Date.now(),
       attachments: pendingAtts,
     };
-    setMessages((prev) => {
-      const key = activeThreadKey();
-      const next = [...prev, userMsg];
-      messagesRef.current = next;
-      if (key) {
-        touchCache(key, { messages: next, busy: true });
-        persistNow(key);
-      }
-      return next;
-    });
+    const nextMsgs = [...messagesRef.current, userMsg];
+    messagesRef.current = nextMsgs;
+    setMessages(nextMsgs);
+    const key = activeThreadKey();
+    if (key) {
+      touchCache(key, { messages: nextMsgs, busy: true });
+      persistNow(key);
+    }
 
     try {
       await window.grokDeck.agent.prompt({
@@ -1350,6 +1403,8 @@ export function App() {
         })),
       });
     } catch (err) {
+      const k = activeThreadKey();
+      if (k) streamingByKey.current[k] = null;
       setBusy(false);
       busyRef.current = false;
       streamingId.current = null;
@@ -1438,8 +1493,12 @@ export function App() {
     cancelTimerRef.current = window.setTimeout(() => {
       setBusy((b) => {
         if (b) {
+          const k = activeThreadKey();
+          if (k) streamingByKey.current[k] = null;
           streamingId.current = null;
           setLiveMessageId(null);
+          liveIdRef.current = null;
+          busyRef.current = false;
           turnStartRef.current = null;
           setStatusLine("취소됨");
         }
@@ -1727,22 +1786,30 @@ export function App() {
       return;
     }
     // Send to agent as slash command / skill (CLI parity)
-    stickToBottomRef.current = true;
-    usageBaselineRef.current = officialUsed(usageRef.current);
-    setBusy(true);
-    streamingId.current = null;
-    turnStartRef.current = Date.now();
-    setMessages((prev) => [
-      ...prev,
-      { id: uid("u"), role: "user", content: `/${cmd.name}`, createdAt: Date.now() },
-    ]);
+    beginUserTurn();
+    const userMsg: ChatMessage = {
+      id: uid("u"),
+      role: "user",
+      content: `/${cmd.name}`,
+      createdAt: Date.now(),
+    };
+    const nextMsgs = [...messagesRef.current, userMsg];
+    messagesRef.current = nextMsgs;
+    setMessages(nextMsgs);
+    const slashKey = activeThreadKey();
+    if (slashKey) touchCache(slashKey, { messages: nextMsgs, busy: true });
     try {
       if (agentStatus.state === "idle" || agentStatus.state === "error") {
         if (project.root) await window.grokDeck.agent.start(project.root);
       }
       await window.grokDeck.agent.prompt(`/${cmd.name}`);
     } catch (err) {
+      const k = activeThreadKey();
+      if (k) streamingByKey.current[k] = null;
       setBusy(false);
+      busyRef.current = false;
+      streamingId.current = null;
+      setLiveMessageId(null);
       setStatusLine(err instanceof Error ? err.message : String(err));
     }
   }
