@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -21,7 +22,8 @@ import type {
   SessionSummary,
   StreamEvent,
   ToolCallView,
-  WorkspaceFileEntry,
+  QueuedMessage,
+  AgentThreadInfo,
 } from "@grok-deck/shared";
 import {
   BUILTIN_SLASH,
@@ -52,9 +54,50 @@ import { PlanStepsPanel } from "./components/PlanStepsPanel";
 import { ContextMeter } from "./components/ContextMeter";
 import { ResizeHandles } from "./components/ResizeHandles";
 import { PanelDivider } from "./components/PanelDivider";
+import { Composer } from "./components/Composer";
+import { QueueBar } from "./components/QueueBar";
+
+function emitDeckStatus(msg: string) {
+  window.dispatchEvent(new CustomEvent("deck-status", { detail: msg }));
+}
 
 function uid(prefix = "m") {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function payloadChars(value: unknown): number {
+  if (value == null) return 0;
+  if (typeof value === "string") return value.length;
+  try {
+    return JSON.stringify(value).length;
+  } catch {
+    return 0;
+  }
+}
+
+function estimateMessageTokens(m: ChatMessage): number {
+  let chars = (m.content?.length || 0) + (m.thoughts?.length || 0);
+  for (const t of m.toolCalls || []) {
+    chars += (t.title?.length || 0) + payloadChars(t.input) + payloadChars(t.output) + payloadChars(t.content);
+  }
+  return Math.round(chars / 4);
+}
+
+function estimateTranscriptTokens(messages: ChatMessage[]): number {
+  return messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+}
+
+function threadKey(cwd: string, sessionId: string): string {
+  return `${cwd.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()}::${sessionId}`;
+}
+
+function officialUsed(u: TokenUsage | null | undefined): number | null {
+  if (!u) return null;
+  if (u.totalTokens != null) return u.totalTokens;
+  if (u.inputTokens != null || u.outputTokens != null) {
+    return (u.inputTokens || 0) + (u.outputTokens || 0);
+  }
+  return null;
 }
 
 function shortPath(p: string | null | undefined) {
@@ -163,11 +206,6 @@ export function App() {
   const [agentStatus, setAgentStatus] = useState<AgentRuntimeStatus>({ state: "idle" });
   const [mode, setMode] = useState<DeckMode>("normal");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
-  const [mentionOpen, setMentionOpen] = useState(false);
-  const [mentionFilter, setMentionFilter] = useState("");
-  const [mentionHits, setMentionHits] = useState<WorkspaceFileEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [loginBusy, setLoginBusy] = useState(false);
   const [statusLine, setStatusLine] = useState("Ready");
@@ -185,9 +223,6 @@ export function App() {
   const [ghost, setGhost] = useState<GhostStatus>({ canUndo: false, depth: 0 });
   const [undoing, setUndoing] = useState(false);
   const [slashCmds, setSlashCmds] = useState<SlashCommand[]>(BUILTIN_SLASH);
-  const [slashOpen, setSlashOpen] = useState(false);
-  const [slashFilter, setSlashFilter] = useState("");
-  const [configOpen, setConfigOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [creatingProject, setCreatingProject] = useState(false);
@@ -208,10 +243,72 @@ export function App() {
   const [planDismissed, setPlanDismissed] = useState(false);
   /** State mirror of streaming message id — ref alone does not trigger re-render for `live` */
   const [liveMessageId, setLiveMessageId] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState("");
+  const [compact, setCompact] = useState<{
+    status: "idle" | "started" | "done" | "failed";
+    before?: number;
+    after?: number;
+    at?: number;
+    message?: string;
+  }>({ status: "idle" });
+  const [draftSeed, setDraftSeed] = useState(0);
+  const [draftSeedText, setDraftSeedText] = useState("");
+  const [dragCwd, setDragCwd] = useState<string | null>(null);
+  const [overCwd, setOverCwd] = useState<string | null>(null);
+  const [queue, setQueue] = useState<QueuedMessage[]>([]);
+  const [agentThreads, setAgentThreads] = useState<AgentThreadInfo[]>([]);
 
   const chatRef = useRef<HTMLDivElement>(null);
+  const chatInnerRef = useRef<HTMLDivElement>(null);
   const streamingId = useRef<string | null>(null);
   const turnStartRef = useRef<number | null>(null);
+  const stickToBottomRef = useRef(true);
+  const ignoreScrollRef = useRef(false);
+  const cancelTimerRef = useRef<number | null>(null);
+  const usageRef = useRef<TokenUsage | null>(null);
+  const usageBaselineRef = useRef<number | null>(null);
+  const selectingRef = useRef(false);
+  const activeKeyRef = useRef("");
+  const cacheRef = useRef<
+    Record<
+      string,
+      {
+        sessionId: string;
+        cwd: string;
+        messages: ChatMessage[];
+        queue: QueuedMessage[];
+        busy: boolean;
+        liveMessageId: string | null;
+      }
+    >
+  >({});
+  const persistTimers = useRef<Record<string, number>>({});
+  const streamingByKey = useRef<Record<string, string | null>>({});
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const queueRef = useRef<QueuedMessage[]>([]);
+  const busyRef = useRef(false);
+  const liveIdRef = useRef<string | null>(null);
+  const sessionRef = useRef<SessionSummary | null>(null);
+  const projectRef = useRef<ProjectState>({ root: null, recent: [] });
+  const submitRef = useRef<(text: string, atts: ChatAttachment[]) => void>(() => undefined);
+
+  const scrollChatToBottom = useCallback((force = false) => {
+    const el = chatRef.current;
+    if (!el) return;
+    if (selectingRef.current) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && el.contains(sel.anchorNode)) return;
+    if (!force && !stickToBottomRef.current) return;
+    ignoreScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+        ignoreScrollRef.current = false;
+      });
+    });
+  }, []);
 
   const permission = permissionQueue[0] ?? null;
 
@@ -219,13 +316,11 @@ export function App() {
     const list = await window.grokDeck.sessions.list(showNoiseSessions);
     setProjects(list);
     setExpanded((prev) => {
-      const next = { ...prev };
-      for (const g of list) {
-        if (next[g.cwd] === undefined) next[g.cwd] = true;
-      }
+      const persisted = settings.sidebarExpanded || {};
+      const next = { ...persisted, ...prev };
       return next;
     });
-  }, [showNoiseSessions]);
+  }, [showNoiseSessions, settings.sidebarExpanded]);
 
   const refresh = useCallback(async () => {
     const [a, p, s, st, m, cat] = await Promise.all([
@@ -242,6 +337,9 @@ export function App() {
     setAgentStatus(st);
     setMode(m || s.deckMode || "normal");
     setCustomThemes(cat.themes || []);
+    if (s.sidebarExpanded) {
+      setExpanded((prev) => ({ ...prev, ...s.sidebarExpanded }));
+    }
     await refreshSessions();
     try {
       setGhost(await window.grokDeck.ghost.status());
@@ -253,6 +351,13 @@ export function App() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    void window.grokDeck.app.getVersion().then((v) => {
+      setAppVersion(v);
+      document.title = v ? `Grok Deck ${v}` : "Grok Deck";
+    });
+  }, []);
 
   useEffect(() => {
     void refreshSessions();
@@ -288,12 +393,19 @@ export function App() {
 
   useEffect(() => {
     const offEvent = window.grokDeck.agent.onEvent((event) => handleStreamEvent(event));
+    const offThreads = window.grokDeck.agent.onThreads((threads) => setAgentThreads(threads));
     const offStatus = window.grokDeck.agent.onStatus((status) => {
       setAgentStatus(status);
       if ("mode" in status && status.mode) setMode(status.mode);
       if (status.state === "ready") {
         setStatusLine(`Ready · ${shortPath(status.cwd)}`);
-        // Agent restart recreates GhostGit in memory — reload disk history for UI
+        if (!sessionRef.current?.id && "sessionId" in status && status.sessionId) {
+          adoptSession({
+            id: status.sessionId,
+            cwd: status.cwd,
+            title: "새 세션",
+          });
+        }
         void window.grokDeck.ghost.status().then(setGhost);
       }
       if (status.state === "running") setStatusLine("Working…");
@@ -301,15 +413,55 @@ export function App() {
       if (status.state === "idle") setStatusLine("Idle");
       if (status.state === "starting") setStatusLine("Starting…");
     });
+    const onHide = () => {
+      const s = sessionRef.current;
+      const root = s?.cwd || projectRef.current.root;
+      if (!s?.id || !root) return;
+      void window.grokDeck.threads.set({
+        sessionId: s.id,
+        cwd: root,
+        messages: messagesRef.current,
+        queue: queueRef.current,
+        updatedAt: Date.now(),
+      });
+    };
+    window.addEventListener("pagehide", onHide);
+    window.addEventListener("beforeunload", onHide);
     return () => {
       offEvent();
       offStatus();
+      offThreads();
+      window.removeEventListener("pagehide", onHide);
+      window.removeEventListener("beforeunload", onHide);
     };
   }, []);
 
   useEffect(() => {
-    chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, permissionQueue, loadingHistory]);
+    scrollChatToBottom();
+  }, [messages, permissionQueue, loadingHistory, liveMessageId, scrollChatToBottom]);
+
+  // After a thread finishes loading, pin to the latest message (markdown/images settle late)
+  useEffect(() => {
+    if (loadingHistory || messages.length === 0) return;
+    stickToBottomRef.current = true;
+    scrollChatToBottom(true);
+    const timers = [50, 180, 400, 900].map((ms) =>
+      window.setTimeout(() => scrollChatToBottom(true), ms),
+    );
+    return () => timers.forEach((id) => window.clearTimeout(id));
+    // Only re-run when the open thread or load flag changes — not every streamed token
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadingHistory, activeSession?.id]);
+
+  useEffect(() => {
+    const inner = chatInnerRef.current;
+    if (!inner || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      if (stickToBottomRef.current) scrollChatToBottom();
+    });
+    ro.observe(inner);
+    return () => ro.disconnect();
+  }, [scrollChatToBottom, loadingHistory, messages.length > 0]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -325,41 +477,158 @@ export function App() {
         e.preventDefault();
         setNewProjectOpen(true);
       }
+      if (e.key === "Escape" && busy) {
+        e.preventDefault();
+        void onCancelTurn();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [mode, project.root]);
+  }, [mode, project.root, busy]);
 
-  function ensureAssistantMessage(): string {
-    if (streamingId.current) return streamingId.current;
+  function activeThreadKey(): string {
+    const s = sessionRef.current;
+    const root = s?.cwd || projectRef.current.root;
+    if (s?.id && root) return threadKey(root, s.id);
+    return activeKeyRef.current;
+  }
+
+  function adoptSession(session: SessionSummary | null) {
+    setActiveSession(session);
+    sessionRef.current = session;
+    const root = session?.cwd || projectRef.current.root;
+    if (session?.id && root) {
+      activeKeyRef.current = threadKey(root, session.id);
+    } else {
+      activeKeyRef.current = "";
+    }
+  }
+
+  function eventThreadKey(event: StreamEvent): string {
+    if (event.sessionId && event.cwd) return threadKey(event.cwd, event.sessionId);
+    if (event.sessionId && sessionRef.current?.cwd) {
+      return threadKey(sessionRef.current.cwd, event.sessionId);
+    }
+    return activeThreadKey();
+  }
+
+  function schedulePersist(key: string) {
+    const entry = cacheRef.current[key];
+    if (!entry?.sessionId || !entry.cwd) return;
+    if (persistTimers.current[key]) window.clearTimeout(persistTimers.current[key]);
+    persistTimers.current[key] = window.setTimeout(() => {
+      void window.grokDeck.threads.set({
+        sessionId: entry.sessionId,
+        cwd: entry.cwd,
+        messages: entry.messages,
+        queue: entry.queue,
+        updatedAt: Date.now(),
+      });
+    }, 280);
+  }
+
+  function persistNow(key: string) {
+    const entry = cacheRef.current[key];
+    if (!entry?.sessionId || !entry.cwd) return;
+    if (persistTimers.current[key]) window.clearTimeout(persistTimers.current[key]);
+    void window.grokDeck.threads.set({
+      sessionId: entry.sessionId,
+      cwd: entry.cwd,
+      messages: entry.messages,
+      queue: entry.queue,
+      updatedAt: Date.now(),
+    });
+  }
+
+  function touchCache(
+    key: string,
+    patch: Partial<{
+      messages: ChatMessage[];
+      queue: QueuedMessage[];
+      busy: boolean;
+      liveMessageId: string | null;
+    }>,
+  ) {
+    const s = sessionRef.current;
+    const prev = cacheRef.current[key];
+    const cwd = prev?.cwd || eventCwdFromKey(key) || s?.cwd || projectRef.current.root || "";
+    const sessionId = prev?.sessionId || key.split("::").slice(-1)[0] || s?.id || "";
+    cacheRef.current[key] = {
+      sessionId,
+      cwd,
+      messages: patch.messages ?? prev?.messages ?? (key === activeThreadKey() ? messagesRef.current : []),
+      queue: patch.queue ?? prev?.queue ?? (key === activeThreadKey() ? queueRef.current : []),
+      busy: patch.busy ?? prev?.busy ?? false,
+      liveMessageId: patch.liveMessageId === undefined ? prev?.liveMessageId ?? null : patch.liveMessageId,
+    };
+    schedulePersist(key);
+  }
+
+  function eventCwdFromKey(key: string): string {
+    const idx = key.lastIndexOf("::");
+    return idx > 0 ? key.slice(0, idx) : "";
+  }
+
+  function ensureAssistantMessage(key?: string): string {
+    const k = key || activeThreadKey();
+    const existing = streamingByKey.current[k] || (k === activeThreadKey() ? streamingId.current : null);
+    if (existing) return existing;
     const id = uid("a");
-    streamingId.current = id;
-    setLiveMessageId(id);
-    setMessages((prev) => [
+    streamingByKey.current[k] = id;
+    if (k === activeThreadKey()) {
+      streamingId.current = id;
+      setLiveMessageId(id);
+      liveIdRef.current = id;
+    }
+    const add = (prev: ChatMessage[]) => [
       ...prev,
-      { id, role: "assistant", content: "", thoughts: "", toolCalls: [], createdAt: Date.now() },
-    ]);
+      { id, role: "assistant" as const, content: "", thoughts: "", toolCalls: [], createdAt: Date.now() },
+    ];
+    if (k === activeThreadKey()) {
+      setMessages((prev) => {
+        const next = add(prev);
+        messagesRef.current = next;
+        touchCache(k, { messages: next, liveMessageId: id, busy: true });
+        return next;
+      });
+    } else {
+      const prev = cacheRef.current[k]?.messages || [];
+      touchCache(k, { messages: add(prev), liveMessageId: id, busy: true });
+    }
     return id;
   }
 
-  function patchAssistant(id: string, patch: (m: ChatMessage) => ChatMessage) {
-    setMessages((prev) => prev.map((m) => (m.id === id ? patch(m) : m)));
+  function patchAssistant(id: string, patch: (m: ChatMessage) => ChatMessage, key?: string) {
+    const k = key || activeThreadKey();
+    const apply = (prev: ChatMessage[]) => prev.map((m) => (m.id === id ? patch(m) : m));
+    if (k === activeThreadKey()) {
+      setMessages((prev) => {
+        const next = apply(prev);
+        messagesRef.current = next;
+        touchCache(k, { messages: next });
+        return next;
+      });
+    } else {
+      const prev = cacheRef.current[k]?.messages || [];
+      touchCache(k, { messages: apply(prev) });
+    }
   }
 
   function handleStreamEvent(event: StreamEvent) {
+    const key = eventThreadKey(event);
     switch (event.type) {
       case "text": {
-        const id = ensureAssistantMessage();
-        patchAssistant(id, (m) => ({ ...m, content: m.content + event.text }));
+        const id = ensureAssistantMessage(key);
+        patchAssistant(id, (m) => ({ ...m, content: m.content + event.text }), key);
         break;
       }
       case "thought": {
-        const id = ensureAssistantMessage();
-        patchAssistant(id, (m) => ({ ...m, thoughts: (m.thoughts || "") + event.text }));
+        const id = ensureAssistantMessage(key);
+        patchAssistant(id, (m) => ({ ...m, thoughts: (m.thoughts || "") + event.text }), key);
         break;
       }
       case "tool_call": {
-        const id = ensureAssistantMessage();
+        const id = ensureAssistantMessage(key);
         patchAssistant(id, (m) => {
           const toolCalls = [
             ...(m.toolCalls || []).filter((t) => t.id !== event.call.id),
@@ -379,11 +648,11 @@ export function App() {
                   }
                 : m.editSummary,
           };
-        });
+        }, key);
         break;
       }
       case "tool_call_update": {
-        const id = ensureAssistantMessage();
+        const id = ensureAssistantMessage(key);
         patchAssistant(id, (m) => {
           const toolCalls = (m.toolCalls || []).map((t) =>
             t.id === event.call.id
@@ -400,12 +669,12 @@ export function App() {
                 }
               : m.editSummary;
           return { ...m, toolCalls, editSummary };
-        });
+        }, key);
         break;
       }
       case "plan": {
-        const id = ensureAssistantMessage();
-        patchAssistant(id, (m) => ({ ...m, plan: event.entries }));
+        const id = ensureAssistantMessage(key);
+        patchAssistant(id, (m) => ({ ...m, plan: event.entries }), key);
         if (event.entries?.length) {
           setActivePlan((prev) => ({
             path: prev?.path || "plan",
@@ -465,7 +734,24 @@ export function App() {
           cachedReadTokens: event.usage.cachedReadTokens ?? prev?.cachedReadTokens,
           reasoningTokens: event.usage.reasoningTokens ?? prev?.reasoningTokens,
           contextLimit: event.usage.contextLimit ?? prev?.contextLimit,
+          compactedAt: event.usage.compactedAt ?? prev?.compactedAt,
+          tokensBeforeCompact: event.usage.tokensBeforeCompact ?? prev?.tokensBeforeCompact,
         }));
+        break;
+      case "compact":
+        setCompact({
+          status: event.status,
+          before: event.before,
+          after: event.after,
+          at: event.status === "done" ? Date.now() : undefined,
+          message: event.message,
+        });
+        if (event.usage) {
+          setUsage((prev) => ({ ...(prev || {}), ...event.usage }));
+        }
+        if (event.status === "started") setStatusLine(event.message || "Context 자동 압축 중…");
+        if (event.status === "done") setStatusLine(event.message || "Context 정리됨");
+        if (event.status === "failed") setStatusLine(event.message || "Context 압축 실패");
         break;
       case "context_limit":
         setUsage((u) => ({
@@ -531,13 +817,24 @@ export function App() {
         void window.grokDeck.ghost.status().then(setGhost);
         break;
       case "turn_done": {
-        setBusy(false);
+        if (cancelTimerRef.current) {
+          window.clearTimeout(cancelTimerRef.current);
+          cancelTimerRef.current = null;
+        }
+        const onActive = key === activeThreadKey();
+        streamingByKey.current[key] = null;
+        if (onActive) {
+          setBusy(false);
+          busyRef.current = false;
+        }
+        touchCache(key, { busy: false, liveMessageId: null });
+        persistNow(key);
         const duration =
           event.durationMs ??
           (turnStartRef.current ? Date.now() - turnStartRef.current : undefined);
         turnStartRef.current = null;
-        if (duration != null) setLastTurnMs(duration);
-        if (event.usage) {
+        if (onActive && duration != null) setLastTurnMs(duration);
+        if (onActive && event.usage) {
           setUsage((prev) => ({
             ...(prev || {}),
             ...event.usage,
@@ -547,10 +844,11 @@ export function App() {
             contextLimit: event.usage!.contextLimit ?? prev?.contextLimit,
           }));
         }
-        if (event.ghost) setGhost(event.ghost);
-        // Finalize assistant message: duration + ensure edit summary is visible immediately
-        const finishedId = streamingId.current || liveMessageId;
-        setMessages((prev) => {
+        if (onActive && event.ghost) setGhost(event.ghost);
+        const finishedId =
+          streamingByKey.current[key] ||
+          (onActive ? streamingId.current || liveIdRef.current : cacheRef.current[key]?.liveMessageId);
+        const finalize = (prev: ChatMessage[]) => {
           const next = [...prev];
           let idx = finishedId ? next.findIndex((m) => m.id === finishedId) : -1;
           if (idx < 0) {
@@ -579,23 +877,51 @@ export function App() {
             ...(editSummary ? { editSummary } : {}),
           };
           return next;
-        });
-        streamingId.current = null;
-        setLiveMessageId(null);
-        setStatusLine(
-          event.stopReason
-            ? `Done · ${event.stopReason}${duration ? ` · ${formatDuration(duration)}` : ""}`
-            : duration
-              ? `Done · ${formatDuration(duration)}`
-              : "Done",
-        );
+        };
+        if (onActive) {
+          setMessages((prev) => {
+            const next = finalize(prev);
+            messagesRef.current = next;
+            touchCache(key, { messages: next, busy: false, liveMessageId: null });
+            return next;
+          });
+          streamingId.current = null;
+          setLiveMessageId(null);
+        } else {
+          const prev = cacheRef.current[key]?.messages || [];
+          touchCache(key, { messages: finalize(prev), busy: false, liveMessageId: null });
+        }
+        persistNow(key);
+        if (onActive) {
+          setStatusLine(
+            event.stopReason
+              ? `Done · ${event.stopReason}${duration ? ` · ${formatDuration(duration)}` : ""}`
+              : duration
+                ? `Done · ${formatDuration(duration)}`
+                : "Done",
+          );
+          const rest = queueRef.current;
+          if (rest.length) {
+            const [nxt, ...left] = rest;
+            setQueue(left);
+            queueRef.current = left;
+            touchCache(key, { queue: left });
+            window.setTimeout(() => {
+              if (nxt?.text) void submitRef.current(nxt.text, []);
+            }, 80);
+          }
+        }
         void refreshSessions();
-        void window.grokDeck.ghost.status().then(setGhost);
+        if (onActive) void window.grokDeck.ghost.status().then(setGhost);
         break;
       }
       case "error":
-        setBusy(false);
-        streamingId.current = null;
+        if (key === activeThreadKey()) {
+          setBusy(false);
+          streamingId.current = null;
+        }
+        touchCache(key, { busy: false });
+        persistNow(key);
         setStatusLine(event.message);
         setMessages((prev) => [
           ...prev,
@@ -641,6 +967,8 @@ export function App() {
     if (agentStatus.state === "idle" || agentStatus.state === "error") {
       await window.grokDeck.agent.start(project.root);
     }
+    stickToBottomRef.current = true;
+    usageBaselineRef.current = officialUsed(usageRef.current);
     setBusy(true);
     streamingId.current = null;
     setLiveMessageId(null);
@@ -654,6 +982,7 @@ export function App() {
       await window.grokDeck.agent.prompt({ text: trimmed });
     } catch (err) {
       setBusy(false);
+      busyRef.current = false;
       streamingId.current = null;
       setLiveMessageId(null);
       turnStartRef.current = null;
@@ -663,8 +992,8 @@ export function App() {
 
   async function onImplementPlan(notes: string) {
     setPlanDismissed(true);
-    setStatusLine("계획 적용 · Normal 모드로 구현 시작");
-    await applyMode("normal");
+    setStatusLine("계획 적용 · Always-approve 모드로 구현 시작");
+    await applyMode("yolo");
     const body = notes.trim()
       ? [
           "Approve and implement the plan as written.",
@@ -672,11 +1001,11 @@ export function App() {
           "",
           notes.trim(),
           "",
-          "Start implementing now. Leave Plan mode and make the real code changes.",
+          "Start implementing now. You are in always-approve mode — make the real code changes.",
         ].join("\n")
       : [
           "Approve and implement the plan as written.",
-          "Start implementing now. Leave Plan mode and make the real code/file changes in the project.",
+          "Start implementing now. You are in always-approve mode — make the real code/file changes in the project.",
         ].join("\n");
     await sendAgentText(body);
   }
@@ -718,7 +1047,7 @@ export function App() {
       setChangedFiles(new Map());
       setSelectedDiff(null);
       setPermissionQueue([]);
-      setActiveSession(null);
+      adoptSession(null);
       setActivePlan(null);
       setPlanDismissed(false);
       streamingId.current = null;
@@ -737,21 +1066,44 @@ export function App() {
 
   /** New chat inside current project */
   async function onNewSessionInProject(cwd?: string) {
+    flushActiveThread();
     const root = cwd || project.root;
     if (!root) {
       setNewProjectOpen(true);
       return;
     }
     setMessages([]);
+    messagesRef.current = [];
+    setQueue([]);
+    queueRef.current = [];
     setChangedFiles(new Map());
     setSelectedDiff(null);
     setPermissionQueue([]);
-    setActiveSession(null);
+    adoptSession(null);
     streamingId.current = null;
+    setLiveMessageId(null);
     setBusy(false);
+    busyRef.current = false;
     setProject((p) => ({ ...p, root }));
+    projectRef.current = { ...projectRef.current, root };
     const st = await window.grokDeck.agent.start(root);
     setAgentStatus(st);
+    if (st.state === "ready" && "sessionId" in st && st.sessionId) {
+      const created: SessionSummary = {
+        id: st.sessionId,
+        cwd: st.cwd || root,
+        title: "새 세션",
+      };
+      adoptSession(created);
+      cacheRef.current[threadKey(created.cwd, created.id)] = {
+        sessionId: created.id,
+        cwd: created.cwd,
+        messages: [],
+        queue: [],
+        busy: false,
+        liveMessageId: null,
+      };
+    }
     setStatusLine("새 세션 시작");
     try {
       setGhost(await window.grokDeck.ghost.status());
@@ -777,17 +1129,28 @@ export function App() {
       }
       if (res.project) setProject(res.project);
       else setProject({ root: res.cwd, recent: [res.cwd] });
+      projectRef.current = res.project || { root: res.cwd, recent: [res.cwd] };
       setMessages([]);
+      messagesRef.current = [];
+      setQueue([]);
+      queueRef.current = [];
       setChangedFiles(new Map());
       setSelectedDiff(null);
       setPermissionQueue([]);
-      setActiveSession(null);
+      adoptSession(null);
       streamingId.current = null;
       setNewProjectOpen(false);
       setNewProjectName("");
       setStatusLine(res.message);
       const st = await window.grokDeck.agent.getStatus();
       setAgentStatus(st);
+      if (st.state === "ready" && "sessionId" in st && st.sessionId) {
+        adoptSession({
+          id: st.sessionId,
+          cwd: st.cwd || res.cwd,
+          title: name,
+        });
+      }
       await refreshSessions();
     } finally {
       setCreatingProject(false);
@@ -800,26 +1163,66 @@ export function App() {
     const res = await window.grokDeck.sessions.delete(sessionId, cwd);
     setStatusLine(res.message);
     if (activeSession?.id === sessionId) {
-      setActiveSession(null);
+      adoptSession(null);
       setMessages([]);
     }
     await refreshSessions();
   }
 
+  function flushActiveThread() {
+    const key = activeKeyRef.current;
+    const s = sessionRef.current;
+    const root = s?.cwd || projectRef.current.root;
+    if (!key || !s?.id || !root) return;
+    if (!messagesRef.current.length && cacheRef.current[key]?.messages.length) return;
+    const entry = {
+      sessionId: s.id,
+      cwd: root,
+      messages: messagesRef.current,
+      queue: queueRef.current,
+      busy: busyRef.current,
+      liveMessageId: liveIdRef.current,
+    };
+    cacheRef.current[key] = entry;
+    persistNow(key);
+  }
+
   async function openSession(group: ProjectGroup, session: SessionSummary) {
+    flushActiveThread();
     setLoadingHistory(true);
-    setActiveSession(session);
+    const bound = { ...session, cwd: group.cwd };
+    const key = threadKey(group.cwd, bound.id);
+    adoptSession(bound);
     setProject({ root: group.cwd, recent: project.recent });
+    projectRef.current = { root: group.cwd, recent: project.recent };
     setChangedFiles(new Map());
     setSelectedDiff(null);
     setPermissionQueue([]);
-    streamingId.current = null;
-    setBusy(false);
+    stickToBottomRef.current = true;
+
+    const cached = cacheRef.current[key];
+    const running = agentThreads.some(
+      (t) => t.sessionId === bound.id && t.state === "running",
+    );
 
     try {
-      const transcript = await window.grokDeck.sessions.transcript(session.id, group.cwd);
-      setMessages(
-        transcript.map((t) => ({
+      if (cached?.messages.length) {
+        setMessages(cached.messages);
+        messagesRef.current = cached.messages;
+        setQueue(cached.queue || []);
+        queueRef.current = cached.queue || [];
+        setBusy(cached.busy || running);
+        setLiveMessageId(cached.liveMessageId);
+        streamingId.current = cached.liveMessageId;
+        setStatusLine(`이어서 · ${bound.title}`);
+      } else {
+        streamingId.current = null;
+        setLiveMessageId(null);
+        const raw = await window.grokDeck.sessions.transcript(bound.id, group.cwd);
+        const payload = Array.isArray(raw)
+          ? { messages: raw, queue: [] as QueuedMessage[] }
+          : raw;
+        const mapped = (payload.messages || []).map((t) => ({
           ...t,
           toolCalls: t.toolCalls?.map((tc) => ({
             id: tc.id,
@@ -828,14 +1231,29 @@ export function App() {
             status: (tc.status as ToolCallView["status"]) || "completed",
             input: tc.input,
           })),
-        })),
-      );
-      setStatusLine(`Loaded · ${session.title}`);
+        }));
+        setMessages(mapped);
+        messagesRef.current = mapped;
+        setQueue(payload.queue || []);
+        queueRef.current = payload.queue || [];
+        setBusy(running);
+        cacheRef.current[key] = {
+          sessionId: bound.id,
+          cwd: group.cwd,
+          messages: mapped,
+          queue: payload.queue || [],
+          busy: running,
+          liveMessageId: null,
+        };
+        setStatusLine(`Loaded · ${bound.title}`);
+      }
 
-      // Start/resume agent for this project (history already painted)
-      const st = await window.grokDeck.agent.loadSession(group.cwd, session.id);
+      const st = await window.grokDeck.agent.loadSession(group.cwd, bound.id);
       setAgentStatus(st);
       if ("mode" in st && st.mode) setMode(st.mode);
+      if (st.state === "error") {
+        setStatusLine(st.message || "이 스레드 에이전트를 열지 못했습니다");
+      }
     } catch (err) {
       setStatusLine(err instanceof Error ? err.message : String(err));
     } finally {
@@ -852,118 +1270,9 @@ export function App() {
     }
   }
 
-  function addAttachments(list: ChatAttachment[]) {
-    if (!list.length) return;
-    setAttachments((prev) => {
-      const map = new Map(prev.map((a) => [a.path.toLowerCase(), a]));
-      for (const a of list) map.set(a.path.toLowerCase(), a);
-      return [...map.values()];
-    });
-  }
-
-  function removeAttachment(id: string) {
-    setAttachments((prev) => prev.filter((a) => a.id !== id));
-  }
-
-  async function onPickAttachments() {
-    try {
-      const res = await window.grokDeck.attachments.pick();
-      if (!res.ok && res.message) setStatusLine(res.message);
-      if (res.attachments?.length) {
-        addAttachments(res.attachments);
-        setStatusLine(`${res.attachments.length}개 파일 첨부`);
-      }
-    } catch (err) {
-      setStatusLine(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  function pathsFromFileList(files: FileList | null | undefined): string[] {
-    if (!files?.length) return [];
-    const paths: string[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      if (!f) continue;
-      const p = window.grokDeck.attachments.pathForFile(f);
-      if (p) paths.push(p);
-    }
-    return paths;
-  }
-
-  async function onPasteFiles(e: React.ClipboardEvent) {
-    const paths = pathsFromFileList(e.clipboardData?.files);
-    if (!paths.length) return;
-    e.preventDefault();
-    const atts = await window.grokDeck.attachments.fromPaths(paths);
-    addAttachments(atts);
-  }
-
-  async function onDropFiles(e: React.DragEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-    const paths = pathsFromFileList(e.dataTransfer?.files);
-    if (!paths.length) return;
-    const atts = await window.grokDeck.attachments.fromPaths(paths);
-    addAttachments(atts);
-  }
-
-  /** Detect trailing @query for file mention autocomplete */
-  function updateMentionFromDraft(value: string, caret = value.length) {
-    const before = value.slice(0, caret);
-    const m = before.match(/(?:^|[\s\n])@([^\s@]*)$/);
-    if (m) {
-      setMentionOpen(true);
-      setMentionFilter(m[1] || "");
-      setSlashOpen(false);
-    } else {
-      setMentionOpen(false);
-      setMentionFilter("");
-    }
-  }
-
-  useEffect(() => {
-    if (!mentionOpen || !project.root) {
-      setMentionHits([]);
-      return;
-    }
-    let cancelled = false;
-    const t = setTimeout(() => {
-      void window.grokDeck.workspace
-        .searchFiles(mentionFilter, project.root || undefined)
-        .then((hits) => {
-          if (!cancelled) setMentionHits(hits);
-        });
-    }, 80);
-    return () => {
-      cancelled = true;
-      clearTimeout(t);
-    };
-  }, [mentionOpen, mentionFilter, project.root]);
-
-  function insertMention(file: WorkspaceFileEntry) {
-    setDraft((prev) => {
-      const m = prev.match(/^(.*(?:^|[\s\n]))@([^\s@]*)$/s);
-      if (m) {
-        return `${m[1]}@${file.relative} `;
-      }
-      // Replace last @token
-      const idx = prev.lastIndexOf("@");
-      if (idx >= 0) {
-        const afterAt = prev.slice(idx + 1);
-        if (!/\s/.test(afterAt)) {
-          return `${prev.slice(0, idx)}@${file.relative} `;
-        }
-      }
-      return `${prev}${prev.endsWith(" ") || !prev ? "" : " "}@${file.relative} `;
-    });
-    setMentionOpen(false);
-    // Also attach the file so agent gets resource_link
-    void window.grokDeck.attachments.fromPaths([file.path]).then(addAttachments);
-  }
-
-  async function onSend() {
-    const text = draft.trim();
-    if ((!text && attachments.length === 0) || busy) return;
+  async function handleSubmit(text: string, pendingAtts: ChatAttachment[]) {
+    const trimmed = text.trim();
+    if ((!trimmed && pendingAtts.length === 0) || busy) return;
     if (auth.state !== "authenticated") {
       setStatusLine("Sign in with Grok first");
       return;
@@ -973,35 +1282,66 @@ export function App() {
       return;
     }
 
-    if (agentStatus.state === "idle" || agentStatus.state === "error") {
-      await window.grokDeck.agent.start(project.root);
+    const cwd = sessionRef.current?.cwd || project.root;
+    let session = sessionRef.current;
+    if (session?.id) {
+      const st = await window.grokDeck.agent.loadSession(cwd, session.id);
+      setAgentStatus(st);
+      if (st.state === "error") {
+        setStatusLine(st.message || "이 스레드를 이어갈 수 없습니다. 새 방을 만들지 않았습니다.");
+        return;
+      }
+      if ("sessionId" in st && st.sessionId && st.sessionId !== session.id) {
+        setStatusLine("에이전트가 다른 세션으로 열렸습니다. 전송을 취소했습니다.");
+        return;
+      }
+    } else {
+      const st = await window.grokDeck.agent.start(cwd);
+      setAgentStatus(st);
+      if (st.state !== "ready" || !("sessionId" in st) || !st.sessionId) {
+        setStatusLine(st.state === "error" ? st.message : "새 세션을 시작하지 못했습니다");
+        return;
+      }
+      session = {
+        id: st.sessionId,
+        cwd: st.cwd || cwd,
+        title: "새 세션",
+      };
+      adoptSession(session);
     }
 
-    const pendingAtts = [...attachments];
-    const displayText = text || (pendingAtts.length ? `(첨부 ${pendingAtts.length}개)` : "");
-    setDraft("");
-    setAttachments([]);
-    setSlashOpen(false);
-    setMentionOpen(false);
+    const displayText = trimmed || (pendingAtts.length ? `(첨부 ${pendingAtts.length}개)` : "");
+    stickToBottomRef.current = true;
+    usageBaselineRef.current = officialUsed(usageRef.current);
     setBusy(true);
+    busyRef.current = true;
     streamingId.current = null;
     setLiveMessageId(null);
     turnStartRef.current = Date.now();
     setLastTurnMs(null);
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: uid("u"),
-        role: "user",
-        content: displayText,
-        createdAt: Date.now(),
-        attachments: pendingAtts,
-      },
-    ]);
+    const userMsg: ChatMessage = {
+      id: uid("u"),
+      role: "user",
+      content: displayText,
+      createdAt: Date.now(),
+      attachments: pendingAtts,
+    };
+    setMessages((prev) => {
+      const key = activeThreadKey();
+      const next = [...prev, userMsg];
+      messagesRef.current = next;
+      if (key) {
+        touchCache(key, { messages: next, busy: true });
+        persistNow(key);
+      }
+      return next;
+    });
 
     try {
       await window.grokDeck.agent.prompt({
-        text: text || "Please review the attached files.",
+        text: trimmed || "Please review the attached files.",
+        sessionId: session?.id,
+        cwd: session?.cwd || cwd,
         attachments: pendingAtts.map((a) => ({
           path: a.path,
           name: a.name,
@@ -1011,11 +1351,101 @@ export function App() {
       });
     } catch (err) {
       setBusy(false);
+      busyRef.current = false;
       streamingId.current = null;
       setLiveMessageId(null);
       turnStartRef.current = null;
       setStatusLine(err instanceof Error ? err.message : String(err));
     }
+  }
+  submitRef.current = (text, atts) => {
+    void handleSubmit(text, atts);
+  };
+
+  function enqueueMessage(text: string) {
+    const item: QueuedMessage = { id: uid("q"), text, createdAt: Date.now() };
+    setQueue((prev) => {
+      const next = [...prev, item];
+      queueRef.current = next;
+      const key = activeThreadKey();
+      if (key) {
+        touchCache(key, { queue: next });
+        persistNow(key);
+      }
+      return next;
+    });
+    setStatusLine("큐에 추가됨 · 현재 턴이 끝나면 자동 전송");
+  }
+
+  function editQueued(id: string, text: string) {
+    setQueue((prev) => {
+      const next = prev.map((q) => (q.id === id ? { ...q, text } : q));
+      queueRef.current = next;
+      const key = activeThreadKey();
+      if (key) {
+        touchCache(key, { queue: next });
+        persistNow(key);
+      }
+      return next;
+    });
+  }
+
+  function removeQueued(id: string) {
+    setQueue((prev) => {
+      const next = prev.filter((q) => q.id !== id);
+      queueRef.current = next;
+      const key = activeThreadKey();
+      if (key) {
+        touchCache(key, { queue: next });
+        persistNow(key);
+      }
+      return next;
+    });
+  }
+
+  function runQueued(id: string) {
+    const item = queueRef.current.find((q) => q.id === id);
+    if (!item) return;
+    const rest = queueRef.current.filter((q) => q.id !== id);
+    if (busy) {
+      const next = [item, ...rest];
+      setQueue(next);
+      queueRef.current = next;
+      const key = activeThreadKey();
+      if (key) touchCache(key, { queue: next });
+      setStatusLine("큐 맨 앞으로 올렸습니다. 현재 턴 다음 실행");
+      return;
+    }
+    setQueue(rest);
+    queueRef.current = rest;
+    const key = activeThreadKey();
+    if (key) {
+      touchCache(key, { queue: rest });
+      persistNow(key);
+    }
+    void handleSubmit(item.text, []);
+  }
+
+  async function onCancelTurn() {
+    if (!busy) return;
+    setStatusLine("취소 요청…");
+    try {
+      await window.grokDeck.agent.cancel();
+    } catch (err) {
+      setStatusLine(err instanceof Error ? err.message : String(err));
+    }
+    if (cancelTimerRef.current) window.clearTimeout(cancelTimerRef.current);
+    cancelTimerRef.current = window.setTimeout(() => {
+      setBusy((b) => {
+        if (b) {
+          streamingId.current = null;
+          setLiveMessageId(null);
+          turnStartRef.current = null;
+          setStatusLine("취소됨");
+        }
+        return false;
+      });
+    }, 6000);
   }
 
   async function openExternal(target: "explorer" | "powershell" | "cmd" | "vscode" | "cursor") {
@@ -1101,7 +1531,6 @@ export function App() {
     setSettings((s) => ({ ...s, reasoningEffort: effort }));
     await window.grokDeck.agent.setEffort(effort);
     setStatusLine(`추론 강도: ${effort}`);
-    setConfigOpen(false);
   }
 
   async function refreshCustomThemes() {
@@ -1267,23 +1696,11 @@ export function App() {
     });
   }
 
-  const filteredSlash = useMemo(() => {
-    const q = slashFilter.replace(/^\//, "").toLowerCase();
-    if (!q) return slashCmds;
-    return slashCmds.filter(
-      (c) =>
-        c.name.toLowerCase().includes(q) ||
-        c.description.toLowerCase().includes(q) ||
-        (c.kind === "skill" && "skill".includes(q)),
-    );
-  }, [slashCmds, slashFilter]);
-
   useEffect(() => {
     void refreshSlashCommands();
   }, [project.root, agentStatus.state]);
 
   async function runSlash(cmd: SlashCommand) {
-    setSlashOpen(false);
     if (cmd.name === "new" || cmd.name === "clear") {
       await onNewSessionInProject();
       return;
@@ -1310,7 +1727,8 @@ export function App() {
       return;
     }
     // Send to agent as slash command / skill (CLI parity)
-    setDraft("");
+    stickToBottomRef.current = true;
+    usageBaselineRef.current = officialUsed(usageRef.current);
     setBusy(true);
     streamingId.current = null;
     turnStartRef.current = Date.now();
@@ -1371,6 +1789,82 @@ export function App() {
     activeSession?.title ||
     (project.root ? shortPath(project.root) : "Grok Deck");
 
+  const orderedProjects = useMemo(() => {
+    const order = settings.projectOrder;
+    if (!order?.length) return projects;
+    const rank = new Map(order.map((c, i) => [c.replace(/\\/g, "/").toLowerCase(), i]));
+    const known: ProjectGroup[] = [];
+    const unknown: ProjectGroup[] = [];
+    for (const g of projects) {
+      const k = g.cwd.replace(/\\/g, "/").toLowerCase();
+      if (rank.has(k)) known.push(g);
+      else unknown.push(g);
+    }
+    known.sort((a, b) => {
+      const ia = rank.get(a.cwd.replace(/\\/g, "/").toLowerCase()) ?? 0;
+      const ib = rank.get(b.cwd.replace(/\\/g, "/").toLowerCase()) ?? 0;
+      return ia - ib;
+    });
+    return [...unknown, ...known];
+  }, [projects, settings.projectOrder]);
+
+  usageRef.current = usage;
+  messagesRef.current = messages;
+  queueRef.current = queue;
+  busyRef.current = busy;
+  liveIdRef.current = liveMessageId;
+  sessionRef.current = activeSession;
+  projectRef.current = project;
+
+  const estimatedTokens = useMemo(() => estimateTranscriptTokens(messages), [messages]);
+
+  const liveExtra = useMemo(() => {
+    if (!busy) return 0;
+    let extra = 0;
+    if (liveMessageId) {
+      const live = messages.find((m) => m.id === liveMessageId);
+      if (live) extra += estimateMessageTokens(live);
+    }
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === "user") {
+        extra += estimateMessageTokens(messages[i]!);
+        break;
+      }
+    }
+    return extra;
+  }, [busy, liveMessageId, messages]);
+
+  function persistExpanded(next: Record<string, boolean>) {
+    setExpanded(next);
+    void saveSettingsLocal({ ...settings, sidebarExpanded: next });
+  }
+
+  function toggleProject(cwd: string, currentlyOpen: boolean) {
+    persistExpanded({ ...expanded, [cwd]: !currentlyOpen });
+  }
+
+  function onDropProject(targetCwd: string) {
+    if (!dragCwd || dragCwd === targetCwd) {
+      setDragCwd(null);
+      setOverCwd(null);
+      return;
+    }
+    const cur = orderedProjects.map((g) => g.cwd);
+    const from = cur.findIndex((c) => c === dragCwd);
+    const to = cur.findIndex((c) => c === targetCwd);
+    if (from < 0 || to < 0) {
+      setDragCwd(null);
+      setOverCwd(null);
+      return;
+    }
+    const next = [...cur];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved!);
+    void saveSettingsLocal({ ...settings, projectOrder: next });
+    setDragCwd(null);
+    setOverCwd(null);
+  }
+
   const fileList = [...changedFiles.keys()];
   const activeDiff = selectedDiff ? changedFiles.get(selectedDiff) : undefined;
   const totalStats = useMemo(() => {
@@ -1411,7 +1905,10 @@ export function App() {
         <div className="sidebar-top">
           <div className="logo">
             <img className="logo-img" src="./logo.png" alt="" />
-            Grok Deck
+            <span className="logo-text">
+              Grok Deck
+              {appVersion ? <span className="logo-ver">v{appVersion}</span> : null}
+            </span>
           </div>
         </div>
 
@@ -1622,7 +2119,8 @@ export function App() {
                       type="button"
                       className="btn btn-sm"
                       onClick={() => {
-                        setDraft(`/imagine-video ${aiThemePrompt}`);
+                        setDraftSeedText(`/imagine-video ${aiThemePrompt}`);
+                        setDraftSeed((n) => n + 1);
                         setShowSettings(false);
                       }}
                     >
@@ -1674,19 +2172,52 @@ export function App() {
           ) : null}
 
           <div className="section-label">프로젝트</div>
-          {projects.length === 0 ? (
+          {orderedProjects.length === 0 ? (
             <p className="muted" style={{ padding: "0 10px" }}>
               <strong>새 작업</strong>으로 Documents 아래 프로젝트를 만들거나, 기존 폴더를 여세요.
             </p>
           ) : (
-            projects.map((g) => {
+            orderedProjects.map((g) => {
               const open = expanded[g.cwd] !== false;
               return (
-                <div className="project-block" key={g.cwd}>
+                <div
+                  className={`project-block${dragCwd === g.cwd ? " dragging" : ""}${overCwd === g.cwd ? " drag-over" : ""}`}
+                  key={g.cwd}
+                  onDragOver={(e) => {
+                    if (!dragCwd || dragCwd === g.cwd) return;
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    if (overCwd !== g.cwd) setOverCwd(g.cwd);
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    onDropProject(g.cwd);
+                  }}
+                  onDragLeave={() => {
+                    if (overCwd === g.cwd) setOverCwd(null);
+                  }}
+                >
                   <div className="project-head-row">
                     <button
+                      type="button"
+                      className="project-drag"
+                      title="드래그해서 순서 변경"
+                      draggable
+                      onDragStart={(e) => {
+                        setDragCwd(g.cwd);
+                        e.dataTransfer.effectAllowed = "move";
+                        e.dataTransfer.setData("text/plain", g.cwd);
+                      }}
+                      onDragEnd={() => {
+                        setDragCwd(null);
+                        setOverCwd(null);
+                      }}
+                    >
+                      ⋮⋮
+                    </button>
+                    <button
                       className="project-head"
-                      onClick={() => setExpanded((e) => ({ ...e, [g.cwd]: !open }))}
+                      onClick={() => toggleProject(g.cwd, open)}
                       title={g.cwd}
                     >
                       <span className="chev">{open ? "▾" : "▸"}</span>
@@ -1702,14 +2233,21 @@ export function App() {
                     </button>
                   </div>
                   {open
-                    ? g.sessions.map((s) => (
+                    ? g.sessions.map((s) => {
+                        const running =
+                          busy && activeSession?.id === s.id ||
+                          agentThreads.some((t) => t.sessionId === s.id && t.state === "running") ||
+                          !!cacheRef.current[threadKey(g.cwd, s.id)]?.busy;
+                        return (
                         <div
                           key={s.id}
-                          className={`thread-row ${activeSession?.id === s.id ? "active" : ""}`}
+                          className={`thread-row ${activeSession?.id === s.id ? "active" : ""} ${running ? "running" : ""}`}
+                          title={running ? "실행 중" : "대기"}
                         >
+                          {running ? <span className="thread-run-dot" title="실행 중" /> : null}
                           <button
                             className="thread-item"
-                            title={s.title}
+                            title={running ? `실행 중 · ${s.title}` : s.title}
                             onClick={() => void openSession(g, s)}
                           >
                             {s.title}
@@ -1723,7 +2261,8 @@ export function App() {
                             ×
                           </button>
                         </div>
-                      ))
+                        );
+                      })
                     : null}
                 </div>
               );
@@ -1804,7 +2343,30 @@ export function App() {
           </div>
         </div>
 
-        <div className="chat" ref={chatRef}>
+        <div
+          className="chat"
+          ref={chatRef}
+          onScroll={() => {
+            if (ignoreScrollRef.current) return;
+            const el = chatRef.current;
+            if (!el) return;
+            stickToBottomRef.current =
+              el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+          }}
+          onWheel={() => {
+            const el = chatRef.current;
+            if (!el) return;
+            stickToBottomRef.current =
+              el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+          }}
+          onMouseDown={() => {
+            selectingRef.current = true;
+          }}
+          onMouseUp={() => {
+            selectingRef.current = false;
+          }}
+        >
+          <div className="chat-inner" ref={chatInnerRef}>
           {loadingHistory ? (
             <div className="empty-hero">
               <p className="muted">대화 불러오는 중…</p>
@@ -1854,6 +2416,7 @@ export function App() {
               />
             ))
           )}
+          </div>
         </div>
 
         {permission ? (
@@ -1895,6 +2458,14 @@ export function App() {
           </div>
         ) : null}
 
+        <QueueBar
+          items={queue}
+          busy={busy}
+          onEdit={editQueued}
+          onRemove={removeQueued}
+          onRun={runQueued}
+        />
+
         {activePlan && !planDismissed && (mode === "plan" || mode === "normal") ? (
           <PlanReviewCard
             plan={activePlan}
@@ -1905,223 +2476,26 @@ export function App() {
           />
         ) : null}
 
-        <div className="composer-wrap">
-          <div
-            className="composer"
-            onDragOver={(e) => {
-              e.preventDefault();
-              e.dataTransfer.dropEffect = "copy";
-            }}
-            onDrop={(e) => void onDropFiles(e)}
-          >
-            {slashOpen ? (
-              <div className="slash-menu">
-                {filteredSlash.length === 0 ? (
-                  <div className="slash-empty">일치하는 명령/스킬 없음</div>
-                ) : (
-                  filteredSlash.slice(0, 16).map((c) => (
-                    <button
-                      key={`${c.kind || "cmd"}:${c.name}`}
-                      type="button"
-                      className="slash-item"
-                      onClick={() => void runSlash(c)}
-                    >
-                      <span className="slash-name">
-                        /{c.name}
-                        {c.kind === "skill" ? (
-                          <span className="slash-badge">skill</span>
-                        ) : null}
-                      </span>
-                      <span className="slash-desc">{c.description}</span>
-                    </button>
-                  ))
-                )}
-              </div>
-            ) : null}
-            {mentionOpen ? (
-              <div className="slash-menu mention-menu">
-                {mentionHits.length === 0 ? (
-                  <div className="slash-empty">
-                    {project.root ? "파일 없음 · 다른 이름 입력" : "프로젝트를 먼저 여세요"}
-                  </div>
-                ) : (
-                  mentionHits.slice(0, 12).map((f) => (
-                    <button
-                      key={f.path}
-                      type="button"
-                      className="slash-item"
-                      onClick={() => insertMention(f)}
-                    >
-                      <span className="slash-name">@{f.name}</span>
-                      <span className="slash-desc">{f.relative}</span>
-                    </button>
-                  ))
-                )}
-              </div>
-            ) : null}
-            {configOpen ? (
-              <div className="config-menu">
-                <div className="config-section">
-                  <div className="config-label">모델</div>
-                  <div className="config-row">
-                    <strong>{settings.model}</strong>
-                  </div>
-                </div>
-                <div className="config-section">
-                  <div className="config-label">추론 강도</div>
-                  {REASONING_EFFORTS.map((e) => (
-                    <button
-                      key={e.id}
-                      type="button"
-                      className={`config-opt ${settings.reasoningEffort === e.id ? "active" : ""}`}
-                      onClick={() => void setEffort(e.id)}
-                    >
-                      <span>{e.label}</span>
-                      {settings.reasoningEffort === e.id ? <span>✓</span> : null}
-                    </button>
-                  ))}
-                </div>
-                <div className="config-section">
-                  <div className="config-label">테마</div>
-                  {THEMES.map((t) => (
-                    <button
-                      key={t.id}
-                      type="button"
-                      className={`config-opt ${settings.theme === t.id ? "active" : ""}`}
-                      onClick={() => void setTheme(t.id)}
-                    >
-                      <span>{t.label}</span>
-                      {settings.theme === t.id ? <span>✓</span> : null}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : null}
+        <Composer
+          busy={busy}
+          canType={auth.state === "authenticated"}
+          authReady={auth.state === "authenticated"}
+          projectRoot={project.root}
+          mode={mode}
+          settings={settings}
+          slashCmds={slashCmds}
+          onSubmit={(text, atts) => void handleSubmit(text, atts)}
+          onCancel={() => void onCancelTurn()}
+          onCycleMode={() => void cycleMode()}
+          onSetEffort={(effort) => void setEffort(effort)}
+          onSetTheme={(theme) => void setTheme(theme)}
+          onRunSlash={(cmd) => void runSlash(cmd)}
+          onStatus={setStatusLine}
+          onQueue={enqueueMessage}
+          seedText={draftSeedText}
+          seedNonce={draftSeed}
+        />
 
-            {attachments.length > 0 ? (
-              <div className="attach-strip">
-                {attachments.map((a) => (
-                  <div key={a.id} className={`attach-chip ${a.kind}`}>
-                    {a.kind === "image" && a.previewUrl ? (
-                      <img src={a.previewUrl} alt={a.name} className="attach-thumb" />
-                    ) : (
-                      <span className="attach-file-icon">📄</span>
-                    )}
-                    <div className="attach-meta">
-                      <span className="attach-name" title={a.path}>
-                        {a.name}
-                      </span>
-                      <span className="attach-sub">
-                        {a.kind === "image" ? "이미지" : "파일"}
-                        {a.size != null ? ` · ${formatBytes(a.size)}` : ""}
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      className="attach-remove"
-                      title="제거"
-                      onClick={() => removeAttachment(a.id)}
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-
-            <textarea
-              value={draft}
-              placeholder={
-                auth.state !== "authenticated"
-                  ? "Grok 로그인 후 메시지를 입력하세요…"
-                  : project.root
-                    ? "메시지 · / 스킬·명령 · @ 파일 멘션 · 클립으로 첨부…"
-                    : "프로젝트를 연 뒤 작업을 입력하세요…"
-              }
-              onChange={(e) => {
-                const v = e.target.value;
-                setDraft(v);
-                const caret = e.target.selectionStart ?? v.length;
-                if (v.startsWith("/") && !v.includes("\n")) {
-                  setSlashOpen(true);
-                  setSlashFilter(v);
-                  setConfigOpen(false);
-                  setMentionOpen(false);
-                } else {
-                  setSlashOpen(false);
-                  setSlashFilter("");
-                  updateMentionFromDraft(v, caret);
-                }
-              }}
-              onPaste={(e) => void onPasteFiles(e)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-                  e.preventDefault();
-                  void onSend();
-                }
-                if (e.key === "Tab" && e.shiftKey) {
-                  e.preventDefault();
-                  void cycleMode();
-                }
-                if (e.key === "Escape") {
-                  setSlashOpen(false);
-                  setMentionOpen(false);
-                  setConfigOpen(false);
-                }
-                if (e.key === "Enter" && !e.ctrlKey && !e.metaKey && slashOpen && filteredSlash[0]) {
-                  e.preventDefault();
-                  void runSlash(filteredSlash[0]);
-                }
-                if (e.key === "Enter" && !e.ctrlKey && !e.metaKey && mentionOpen && mentionHits[0]) {
-                  e.preventDefault();
-                  insertMention(mentionHits[0]);
-                }
-              }}
-              disabled={busy && !permission}
-            />
-            <div className="composer-bar">
-              <div className="composer-left">
-                <button
-                  type="button"
-                  className="btn-icon"
-                  title="파일 첨부"
-                  onClick={() => void onPickAttachments()}
-                  disabled={busy}
-                >
-                  📎
-                </button>
-                <button
-                  type="button"
-                  className="config-trigger"
-                  onClick={() => {
-                    setConfigOpen((v) => !v);
-                    setSlashOpen(false);
-                    setMentionOpen(false);
-                  }}
-                >
-                  {settings.model} · {settings.reasoningEffort} ▾
-                </button>
-                <span className="sep">·</span>
-                <span>{deckModeLabel(mode)}</span>
-              </div>
-              <div className="composer-right">
-                {busy ? (
-                  <button className="btn" onClick={() => void window.grokDeck.agent.cancel()}>
-                    취소
-                  </button>
-                ) : null}
-                <button
-                  className="btn-send"
-                  disabled={busy || (!draft.trim() && attachments.length === 0)}
-                  onClick={() => void onSend()}
-                  title="Ctrl+Enter"
-                >
-                  ↑
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
       </main>
 
       <PanelDivider side="right" onDrag={onRightDrag} onDragEnd={persistPanelWidths} />
@@ -2132,7 +2506,14 @@ export function App() {
           <h4>
             환경 <span style={{ color: "var(--text-muted)", fontWeight: 500 }}>+</span>
           </h4>
-          <ContextMeter usage={usage} />
+          <ContextMeter
+            usage={usage}
+            estimatedTokens={estimatedTokens}
+            liveExtra={liveExtra}
+            live={busy}
+            compact={compact}
+            baseline={usageBaselineRef.current}
+          />
           <div className="env-row">
             <span className="icon"> cons</span>
             변경 사항
@@ -2308,7 +2689,7 @@ export function App() {
   );
 }
 
-function MessageView({
+const MessageView = memo(function MessageView({
   message,
   live = false,
   onReview,
@@ -2352,7 +2733,15 @@ function MessageView({
             ))}
           </div>
         ) : null}
-        {message.content ? <div className="bubble">{message.content}</div> : null}
+        {message.content ? (
+          <div className="bubble">
+            <Markdown
+              text={message.content}
+              projectRoot={projectRoot}
+              onStatus={emitDeckStatus}
+            />
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -2383,10 +2772,7 @@ function MessageView({
         <Markdown
           text={message.content}
           projectRoot={projectRoot}
-          onStatus={(msg) => {
-            // bubble via custom event so App status line can show open results
-            window.dispatchEvent(new CustomEvent("deck-status", { detail: msg }));
-          }}
+          onStatus={emitDeckStatus}
         />
       ) : null}
 
@@ -2445,22 +2831,34 @@ function MessageView({
       ) : null}
     </div>
   );
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-}
+}, (prev, next) => {
+  if (prev.live || next.live) return false;
+  return (
+    prev.message === next.message &&
+    prev.live === next.live &&
+    prev.canUndo === next.canUndo &&
+    prev.undoing === next.undoing &&
+    prev.projectRoot === next.projectRoot
+  );
+});
 
 function ToolSidebar({ messages }: { messages: ChatMessage[] }) {
-  const tools = [...messages]
-    .reverse()
-    .flatMap((m) => m.toolCalls || [])
-    .slice(0, 10);
+  const tools: ToolCallView[] = [];
+  const seen = new Set<string>();
+  // Newest message first, and within a turn the last-invoked tool first.
+  for (let i = messages.length - 1; i >= 0 && tools.length < 12; i--) {
+    const calls = messages[i]?.toolCalls;
+    if (!calls?.length) continue;
+    for (let j = calls.length - 1; j >= 0 && tools.length < 12; j--) {
+      const t = calls[j];
+      if (!t || seen.has(t.id)) continue;
+      seen.add(t.id);
+      tools.push(t);
+    }
+  }
   if (!tools.length) return <p className="muted">도구 호출이 여기 표시됩니다.</p>;
   return (
-    <div className="stack">
+    <div className="stack recent-tools">
       {tools.map((t) => (
         <ToolChip key={t.id} tool={t} />
       ))}

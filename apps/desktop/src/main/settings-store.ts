@@ -68,6 +68,13 @@ function migrateSettings(parsed: Partial<AppSettings> & {
         ? parsed.rightWidth
         : DEFAULT_SETTINGS.rightWidth,
     customThemeId: parsed.customThemeId,
+    projectOrder: Array.isArray(parsed.projectOrder)
+      ? parsed.projectOrder.filter((p): p is string => typeof p === "string")
+      : DEFAULT_SETTINGS.projectOrder,
+    sidebarExpanded:
+      parsed.sidebarExpanded && typeof parsed.sidebarExpanded === "object"
+        ? parsed.sidebarExpanded
+        : DEFAULT_SETTINGS.sidebarExpanded,
   };
   if (!parsed.deckMode && parsed.alwaysApprove) migrated.deckMode = "yolo";
   if (!parsed.deckMode && parsed.permissionMode === "plan") migrated.deckMode = "plan";

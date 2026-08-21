@@ -102,7 +102,7 @@ export function PlanReviewCard({ plan, busy, onImplement, onRevise, onDismiss }:
           disabled={!!acting || busy}
           onClick={() => void run("implement")}
         >
-          {acting === "implement" ? "적용 중…" : "계획 적용 · 구현 시작"}
+          {acting === "implement" ? "적용 중…" : "계획 적용 · Always-approve로 구현"}
         </button>
         <button
           type="button"
@@ -115,7 +115,7 @@ export function PlanReviewCard({ plan, busy, onImplement, onRevise, onDismiss }:
         </button>
       </div>
       <p className="plan-review-hint">
-        <strong>적용</strong>하면 Normal 모드로 전환 후 구현을 시작합니다.{" "}
+        <strong>적용</strong>하면 Always-approve 모드로 전환한 뒤 바로 구현합니다.{" "}
         <strong>수정 요청</strong>은 Plan 모드를 유지한 채 계획만 다시 다듬습니다.
       </p>
     </div>

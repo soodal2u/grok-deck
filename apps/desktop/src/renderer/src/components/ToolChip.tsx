@@ -26,9 +26,25 @@ function toolIcon(t: ToolCallView): string {
   return "•";
 }
 
+function chipTitle(tool: ToolCallView): string {
+  const raw = (tool.title || tool.tool || tool.id || "").trim();
+  const noisy = /^call-[a-f0-9-]+$/i.test(raw) || /^tc_/i.test(raw);
+  if (noisy) {
+    const input = tool.input;
+    if (input && typeof input === "object") {
+      const rec = input as Record<string, unknown>;
+      const t = rec.type ?? rec.tool ?? rec.name;
+      if (typeof t === "string" && t.trim()) return t.trim();
+    }
+    if (tool.kind && !["other", "unknown"].includes(tool.kind.toLowerCase())) return tool.kind;
+    if (tool.tool) return tool.tool;
+  }
+  return raw;
+}
+
 export function ToolChip({ tool, defaultOpen = false }: { tool: ToolCallView; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
-  const title = tool.title || tool.tool || tool.id;
+  const title = chipTitle(tool);
   const body = formatPayload(tool.input ?? tool.output ?? tool.content);
 
   return (

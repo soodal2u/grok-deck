@@ -7,8 +7,11 @@ import {
   type AppSettings,
   type DeckMode,
   type OpenExternalTarget,
+  type ClipboardImagePayload,
   type PromptRequest,
   type ReasoningEffort,
+  type ThreadSnapshot,
+  type ChatMessage,
 } from "@grok-deck/shared";
 import { getAuthStatus, loginWithGrokCli, logoutLocal } from "./auth";
 import {
@@ -25,6 +28,12 @@ import {
   listProjects,
   loadTranscript,
 } from "./session-store";
+import {
+  deleteThreadSnapshot,
+  loadThreadSnapshot,
+  mergeTranscriptWithSnapshot,
+  saveThreadSnapshot,
+} from "./thread-store";
 import { openProjectExternal } from "./open-external";
 import { openLocalPath } from "./open-path";
 import { applyEdgeResize, type ResizeEdge } from "./window-resize";
@@ -42,6 +51,7 @@ import {
 import { AgentManager } from "./agent-manager";
 import { ensureDeckHome } from "./paths";
 import {
+  attachmentFromClipboardImage,
   attachmentsFromPaths,
   buildPromptContent,
   pickAttachments,
@@ -130,7 +140,7 @@ async function createWindow() {
     y,
     minWidth: 960,
     minHeight: 640,
-    title: "Grok Deck",
+    title: `Grok Deck ${app.getVersion()}`,
     backgroundColor: "#0b0d10",
     show: false,
     icon,
@@ -224,6 +234,8 @@ async function createWindow() {
 }
 
 function registerIpc() {
+  ipcMain.handle(IpcChannels.appGetVersion, () => app.getVersion());
+
   ipcMain.handle(IpcChannels.authGetStatus, async () => getAuthStatus());
 
   ipcMain.handle(IpcChannels.authLogin, async () => {
@@ -329,6 +341,20 @@ function registerIpc() {
     attachmentsFromPaths(Array.isArray(paths) ? paths : []),
   );
 
+  ipcMain.handle(
+    IpcChannels.attachmentsFromData,
+    async (_e, payload: ClipboardImagePayload) => {
+      if (!payload?.data) return null;
+      try {
+        return await attachmentFromClipboardImage(payload);
+      } catch (err) {
+        return {
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+  );
+
   ipcMain.handle(IpcChannels.skillsList, async (_e, cwd?: string) => {
     const project = await loadProjectState();
     const root = cwd || project.root;
@@ -402,13 +428,31 @@ function registerIpc() {
 
   ipcMain.handle(
     IpcChannels.sessionsTranscript,
-    async (_e, sessionId: string, cwd: string) => loadTranscript(sessionId, cwd),
+    async (_e, sessionId: string, cwd: string) => {
+      const transcript = await loadTranscript(sessionId, cwd);
+      const snap = await loadThreadSnapshot(sessionId, cwd);
+      const merged = mergeTranscriptWithSnapshot(transcript as unknown as ChatMessage[], snap);
+      return { messages: merged.messages, queue: merged.queue, snapshotAt: snap?.updatedAt || 0 };
+    },
   );
 
   ipcMain.handle(
     IpcChannels.sessionsDelete,
-    async (_e, sessionId: string, cwd: string) => deleteSession(sessionId, cwd),
+    async (_e, sessionId: string, cwd: string) => {
+      const res = await deleteSession(sessionId, cwd);
+      await deleteThreadSnapshot(sessionId, cwd);
+      return res;
+    },
   );
+
+  ipcMain.handle(IpcChannels.threadGet, async (_e, sessionId: string, cwd: string) =>
+    loadThreadSnapshot(sessionId, cwd),
+  );
+
+  ipcMain.handle(IpcChannels.threadSet, async (_e, snap: ThreadSnapshot) => {
+    await saveThreadSnapshot(snap);
+    return { ok: true };
+  });
 
   ipcMain.handle(IpcChannels.projectCreate, async (_e, name: string) => {
     const result = await createProject(name);

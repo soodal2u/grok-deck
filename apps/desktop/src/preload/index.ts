@@ -18,10 +18,16 @@ import {
   type SkillInfo,
   type SlashCommand,
   type StreamEvent,
+  type ThreadSnapshot,
   type WorkspaceFileEntry,
+  type AgentThreadInfo,
+  type QueuedMessage,
 } from "@grok-deck/shared";
 
 const api = {
+  app: {
+    getVersion: (): Promise<string> => ipcRenderer.invoke(IpcChannels.appGetVersion),
+  },
   auth: {
     getStatus: (): Promise<AuthStatus> => ipcRenderer.invoke(IpcChannels.authGetStatus),
     login: (): Promise<{ ok: boolean; message?: string; status: AuthStatus }> =>
@@ -60,7 +66,10 @@ const api = {
   sessions: {
     list: (includeNoise?: boolean): Promise<ProjectGroup[]> =>
       ipcRenderer.invoke(IpcChannels.sessionsList, includeNoise),
-    transcript: (sessionId: string, cwd: string): Promise<ChatMessage[]> =>
+    transcript: (
+      sessionId: string,
+      cwd: string,
+    ): Promise<{ messages: ChatMessage[]; queue: QueuedMessage[]; snapshotAt: number } | ChatMessage[]> =>
       ipcRenderer.invoke(IpcChannels.sessionsTranscript, sessionId, cwd),
     delete: (
       sessionId: string,
@@ -100,6 +109,18 @@ const api = {
       ipcRenderer.on(IpcChannels.agentStatus, listener);
       return () => ipcRenderer.removeListener(IpcChannels.agentStatus, listener);
     },
+    onThreads: (handler: (threads: AgentThreadInfo[]) => void) => {
+      const listener = (_: Electron.IpcRendererEvent, threads: AgentThreadInfo[]) =>
+        handler(threads);
+      ipcRenderer.on(IpcChannels.agentThreads, listener);
+      return () => ipcRenderer.removeListener(IpcChannels.agentThreads, listener);
+    },
+  },
+  threads: {
+    get: (sessionId: string, cwd: string): Promise<ThreadSnapshot | null> =>
+      ipcRenderer.invoke(IpcChannels.threadGet, sessionId, cwd),
+    set: (snap: ThreadSnapshot): Promise<{ ok: boolean }> =>
+      ipcRenderer.invoke(IpcChannels.threadSet, snap),
   },
   ghost: {
     undo: (): Promise<{ ok: boolean; message: string }> =>
@@ -111,6 +132,10 @@ const api = {
       ipcRenderer.invoke(IpcChannels.attachmentsPick),
     fromPaths: (paths: string[]): Promise<ChatAttachment[]> =>
       ipcRenderer.invoke(IpcChannels.attachmentsFromPaths, paths),
+    fromClipboardImage: (
+      payload: { mimeType: string; data: string; name?: string },
+    ): Promise<ChatAttachment | { error: string } | null> =>
+      ipcRenderer.invoke(IpcChannels.attachmentsFromData, payload),
     /** Resolve local path for a drag/drop or paste File (Electron 32+) */
     pathForFile: (file: File): string => {
       try {

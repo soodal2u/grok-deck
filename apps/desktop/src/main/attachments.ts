@@ -1,7 +1,12 @@
 import { dialog, type BrowserWindow } from "electron";
-import { readFile, stat } from "node:fs/promises";
-import { basename, extname } from "node:path";
-import type { ChatAttachment, PromptAttachmentRef } from "@grok-deck/shared";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { basename, extname, join } from "node:path";
+import { homedir } from "node:os";
+import type {
+  ChatAttachment,
+  ClipboardImagePayload,
+  PromptAttachmentRef,
+} from "@grok-deck/shared";
 
 const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"]);
 
@@ -158,6 +163,40 @@ export async function attachmentsFromPaths(paths: string[]): Promise<ChatAttachm
     }
   }
   return out;
+}
+
+function extFromMime(mime: string): string {
+  const m = (mime || "").toLowerCase();
+  if (m.includes("png")) return ".png";
+  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+  if (m.includes("webp")) return ".webp";
+  if (m.includes("gif")) return ".gif";
+  if (m.includes("bmp")) return ".bmp";
+  if (m.includes("svg")) return ".svg";
+  return ".png";
+}
+
+/** Save a pasted screenshot / clipboard image and return a ChatAttachment. */
+export async function attachmentFromClipboardImage(
+  payload: ClipboardImagePayload,
+): Promise<ChatAttachment> {
+  const mime = payload.mimeType || "image/png";
+  const ext = extFromMime(mime);
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace("T", "-")
+    .slice(0, 15);
+  const dir = join(homedir(), ".grokdeck", "clipboard");
+  await mkdir(dir, { recursive: true });
+  const name = payload.name?.trim() || `clipboard-${stamp}${ext}`;
+  const safeName = name.replace(/[<>:"/\\|?*]/g, "_");
+  const filePath = join(dir, safeName.endsWith(ext) ? safeName : `${safeName}${ext}`);
+  const buf = Buffer.from(payload.data, "base64");
+  if (!buf.length) throw new Error("빈 클립보드 이미지");
+  if (buf.length > 12 * 1024 * 1024) throw new Error("클립보드 이미지가 너무 큽니다 (12MB 제한)");
+  await writeFile(filePath, buf);
+  return buildAttachment(filePath);
 }
 
 /** ACP content blocks for session/prompt (images as base64, files as resource_link). */

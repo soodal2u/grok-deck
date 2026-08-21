@@ -90,6 +90,12 @@ export class GrokAcpClient extends EventEmitter {
   private reasoningEffort: "low" | "medium" | "high";
   /** Latest plan.md (or ACP plan entries) for Codex-style review UI */
   private lastPlan: PlanDocument | null = null;
+  /** Swallow chat stream while running silent /compact */
+  private silentCompact = false;
+  private lastCompactAt = 0;
+  private liveTurnChars = 0;
+  private lastLiveUsageEmit = 0;
+  private usageAtPromptStart: number | null = null;
 
   constructor(private readonly options: AcpClientOptions) {
     super();
@@ -226,18 +232,10 @@ export class GrokAcpClient extends EventEmitter {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.emitEvent({
-        type: "status",
-        message: `Could not resume agent context (${message}). Showing history; new turns start a fresh agent session.`,
+        type: "error",
+        message: `이 스레드를 이어갈 수 없습니다 (${message}). 새 방을 만들지 않고 중단했습니다.`,
       });
-      // Fall back to a fresh session for continued work
-      const created = await this.request("session/new", {
-        cwd: this.cwd,
-        mcpServers: [],
-      }) as { sessionId?: string };
-      if (!created?.sessionId) throw new Error("session/new failed after load failure");
-      this.sessionId = created.sessionId;
-      await this.emitRestoredProjectState();
-      return { sessionId: created.sessionId, loaded: false };
+      throw err;
     }
   }
 
@@ -289,7 +287,7 @@ export class GrokAcpClient extends EventEmitter {
       clientInfo: {
         name: "grok-deck",
         title: "Grok Deck",
-        version: "0.4.2",
+        version: "0.5.0",
       },
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
@@ -315,6 +313,13 @@ export class GrokAcpClient extends EventEmitter {
     if (!this.sessionId) throw new Error("No active session");
 
     this.turnStartedAt = Date.now();
+    this.liveTurnChars = 0;
+    this.lastLiveUsageEmit = 0;
+    this.usageAtPromptStart =
+      this.lastUsage?.totalTokens ??
+      (this.lastUsage?.inputTokens != null || this.lastUsage?.outputTokens != null
+        ? (this.lastUsage.inputTokens || 0) + (this.lastUsage.outputTokens || 0)
+        : 0);
     const promptBlocks =
       content && content.length > 0
         ? content
@@ -324,11 +329,11 @@ export class GrokAcpClient extends EventEmitter {
       prompt: promptBlocks,
     })) as { stopReason?: string; _meta?: Record<string, unknown> };
 
-    const usage = extractUsage(result?._meta, this.contextLimit);
+    let usage = extractUsage(result?._meta, this.contextLimit);
     if (usage) {
-      this.lastUsage = usage;
-      this.emitEvent({ type: "usage", usage });
-      void saveUsage(this.cwd, usage);
+      this.lastUsage = mergeUsage(this.lastUsage, usage);
+      this.emitEvent({ type: "usage", usage: this.lastUsage });
+      void saveUsage(this.cwd, this.lastUsage);
     }
 
     // Ghost git: one commit per finished agent turn (persisted under ~/.grokdeck/ghost)
@@ -353,13 +358,105 @@ export class GrokAcpClient extends EventEmitter {
       });
     }
 
+    const stopReason = result?.stopReason;
+    if (stopReason !== "cancelled" && this.shouldAutoCompact()) {
+      usage = (await this.runAutoCompact()) || usage;
+    }
+
     this.emitEvent({
       type: "turn_done",
-      stopReason: result?.stopReason,
+      stopReason,
       usage: usage || this.lastUsage || undefined,
       durationMs: this.turnStartedAt ? Date.now() - this.turnStartedAt : undefined,
       ghost: await this.ghost.status(),
     });
+  }
+
+  private usedTokens(): number | undefined {
+    const u = this.lastUsage;
+    if (!u) return undefined;
+    return (
+      u.totalTokens ??
+      (u.inputTokens != null || u.outputTokens != null
+        ? (u.inputTokens || 0) + (u.outputTokens || 0)
+        : undefined)
+    );
+  }
+
+  private shouldAutoCompact(): boolean {
+    if (this.silentCompact) return false;
+    if (Date.now() - this.lastCompactAt < 45_000) return false;
+    const used = this.usedTokens();
+    if (used == null) return false;
+    const limit = this.lastUsage?.contextLimit || this.contextLimit || 500_000;
+    // Compact at 90% of the window, or at 500k — whichever comes first
+    const threshold = Math.min(limit * 0.9, 500_000);
+    return used >= threshold;
+  }
+
+  private async runAutoCompact(): Promise<TokenUsage | null> {
+    if (!this.sessionId || this.closed) return this.lastUsage;
+    const before = this.usedTokens();
+    this.silentCompact = true;
+    this.lastCompactAt = Date.now(); // prevent re-entry while running
+    this.emitEvent({
+      type: "compact",
+      status: "started",
+      before,
+      message: "Context 한도에 가까워 자동 압축을 시작합니다",
+    });
+    try {
+      const result = (await this.request("session/prompt", {
+        sessionId: this.sessionId,
+        prompt: [
+          {
+            type: "text",
+            text: "/compact",
+          },
+        ],
+      })) as { stopReason?: string; _meta?: Record<string, unknown> };
+      const extracted = extractUsage(result?._meta, this.contextLimit);
+      if (extracted) {
+        this.lastUsage = mergeUsage(this.lastUsage, {
+          ...extracted,
+          compactedAt: Date.now(),
+          tokensBeforeCompact: before,
+        });
+      } else if (this.lastUsage) {
+        this.lastUsage = {
+          ...this.lastUsage,
+          compactedAt: Date.now(),
+          tokensBeforeCompact: before,
+        };
+      }
+      if (this.lastUsage) void saveUsage(this.cwd, this.lastUsage);
+      const after = this.usedTokens();
+      this.emitEvent({
+        type: "compact",
+        status: "done",
+        before,
+        after,
+        usage: this.lastUsage || undefined,
+        message:
+          before != null && after != null
+            ? `Context 정리됨 · ${Math.round(before).toLocaleString()} → ${Math.round(after).toLocaleString()}`
+            : "Context 정리됨",
+      });
+      if (this.lastUsage) this.emitEvent({ type: "usage", usage: this.lastUsage });
+      return this.lastUsage;
+    } catch (err) {
+      // Allow a retry on the next turn instead of waiting the full cooldown
+      this.lastCompactAt = Date.now() - 30_000;
+      this.emitEvent({
+        type: "compact",
+        status: "failed",
+        before,
+        message: err instanceof Error ? err.message : String(err),
+      });
+      return this.lastUsage;
+    } finally {
+      this.silentCompact = false;
+    }
   }
 
   async undoGhost(): Promise<{ ok: boolean; message: string }> {
@@ -408,6 +505,7 @@ export class GrokAcpClient extends EventEmitter {
         ...saved,
         contextLimit: saved.contextLimit || this.contextLimit,
       };
+      if (saved.compactedAt) this.lastCompactAt = saved.compactedAt;
       this.emitEvent({ type: "usage", usage: this.lastUsage });
     } else if (this.contextLimit) {
       this.emitEvent({
@@ -440,11 +538,10 @@ export class GrokAcpClient extends EventEmitter {
         });
       }
     }
-    try {
-      await this.request("session/cancel", { sessionId: this.sessionId });
-    } catch {
-      /* best-effort */
-    }
+    // ACP: session/cancel is a *notification* (no id, no response).
+    // Sending it as a request hangs forever if the agent never replies.
+    this.notify("session/cancel", { sessionId: this.sessionId });
+    this.emitEvent({ type: "status", message: "취소 요청" });
   }
 
   /**
@@ -625,27 +722,42 @@ export class GrokAcpClient extends EventEmitter {
 
     switch (kind) {
       case "agent_message_chunk": {
+        if (this.silentCompact) break;
         const content = update.content as { text?: string } | undefined;
-        if (content?.text) this.emitEvent({ type: "text", text: content.text });
+        if (content?.text) {
+          this.emitEvent({ type: "text", text: content.text });
+          this.noteLiveTokens(content.text.length);
+        }
         break;
       }
       case "agent_thought_chunk": {
+        if (this.silentCompact) break;
         const content = update.content as { text?: string } | undefined;
-        if (content?.text) this.emitEvent({ type: "thought", text: content.text });
+        if (content?.text) {
+          this.emitEvent({ type: "thought", text: content.text });
+          this.noteLiveTokens(content.text.length);
+        }
         break;
       }
       case "user_message_chunk":
         // echo of user message — skip
         break;
       case "tool_call": {
+        if (this.silentCompact) break;
         const call = normalizeToolCall(update);
         this.emitEvent({ type: "tool_call", call });
+        try {
+          this.noteLiveTokens(JSON.stringify(call.input ?? call.content ?? "").length);
+        } catch {
+          this.noteLiveTokens(64);
+        }
         for (const d of call.diffs || []) {
           this.emitEvent({ type: "diff", diff: d });
         }
         break;
       }
       case "tool_call_update": {
+        if (this.silentCompact) break;
         const call = normalizeToolCall(update);
         this.emitEvent({ type: "tool_call_update", call });
         for (const d of call.diffs || []) {
@@ -692,19 +804,28 @@ export class GrokAcpClient extends EventEmitter {
         break;
       }
       case "usage_update": {
-        const usage = extractUsage(update, this.contextLimit) || extractUsage(
-          { usage: update },
-          this.contextLimit,
-        );
+        const usage =
+          extractUsage(update, this.contextLimit) ||
+          extractUsage({ usage: update }, this.contextLimit);
         if (usage) {
-          this.lastUsage = usage;
-          this.emitEvent({ type: "usage", usage });
-          void saveUsage(this.cwd, usage);
+          this.lastUsage = mergeUsage(this.lastUsage, usage);
+          this.emitEvent({ type: "usage", usage: this.lastUsage });
+          void saveUsage(this.cwd, this.lastUsage);
         }
         break;
       }
-      default:
-        this.emit("raw_update", update);
+      default: {
+        const maybeUsage =
+          extractUsage(update, this.contextLimit) ||
+          extractUsage({ usage: update }, this.contextLimit);
+        if (maybeUsage && (maybeUsage.totalTokens != null || maybeUsage.inputTokens != null)) {
+          this.lastUsage = mergeUsage(this.lastUsage, maybeUsage);
+          this.emitEvent({ type: "usage", usage: this.lastUsage });
+          void saveUsage(this.cwd, this.lastUsage);
+        } else {
+          this.emit("raw_update", update);
+        }
+      }
     }
   }
 
@@ -1043,6 +1164,28 @@ export class GrokAcpClient extends EventEmitter {
     return absLower.startsWith(cwdPrefix) || absLower === cwdLower;
   }
 
+  private noteLiveTokens(chars: number) {
+    if (this.silentCompact || chars <= 0) return;
+    this.liveTurnChars += chars;
+    if (Date.now() - this.lastLiveUsageEmit < 200) return;
+    this.emitLiveUsage();
+  }
+
+  private emitLiveUsage() {
+    this.lastLiveUsageEmit = Date.now();
+    const extra = Math.round(this.liveTurnChars / 4);
+    const baseline = this.usageAtPromptStart ?? 0;
+    const limit = this.lastUsage?.contextLimit || this.contextLimit || 500_000;
+    this.emitEvent({
+      type: "usage",
+      usage: {
+        ...(this.lastUsage || {}),
+        totalTokens: baseline + extra,
+        contextLimit: limit,
+      },
+    });
+  }
+
   private request(method: string, params: unknown): Promise<unknown> {
     if (!this.proc || this.closed) {
       return Promise.reject(new Error("ACP process not running"));
@@ -1052,6 +1195,11 @@ export class GrokAcpClient extends EventEmitter {
       this.pending.set(id, { resolve, reject });
       this.send({ jsonrpc: "2.0", id, method, params });
     });
+  }
+
+  /** JSON-RPC notification — must not include `id` or the peer may hang. */
+  private notify(method: string, params: unknown) {
+    this.send({ jsonrpc: "2.0", method, params });
   }
 
   private send(msg: JsonRpcMessage) {
@@ -1343,29 +1491,99 @@ function extractContextLimit(init: Record<string, unknown>): number | undefined 
 function extractUsage(meta: unknown, contextLimit: number): TokenUsage | null {
   if (!meta || typeof meta !== "object") return null;
   const m = meta as Record<string, unknown>;
-  const u = (m.usage && typeof m.usage === "object" ? m.usage : m) as Record<string, unknown>;
+  const nested = m.usage && typeof m.usage === "object" ? (m.usage as Record<string, unknown>) : null;
+  const u = nested || m;
+
+  const limit =
+    num(u.size) ??
+    num(u.maxTokens) ??
+    num(u.max_tokens) ??
+    num(u.contextLimit) ??
+    num(u.context_limit) ??
+    num(u.contextWindow) ??
+    num(u.context_window) ??
+    num(m.size) ??
+    num(m.maxTokens) ??
+    contextLimit;
+
+  const remaining =
+    num(u.remaining) ??
+    num(u.remainingTokens) ??
+    num(u.remaining_tokens) ??
+    num(m.remaining);
+  const used =
+    num(u.used) ??
+    num(u.usedTokens) ??
+    num(u.used_tokens) ??
+    num(u.currentTokens) ??
+    num(u.current_tokens) ??
+    num(u.contextTokens) ??
+    num(u.context_tokens) ??
+    num(m.used) ??
+    num(m.usedTokens) ??
+    (remaining != null && limit > 0 ? Math.max(0, limit - remaining) : undefined);
+
+  const input =
+    num(u.inputTokens) ??
+    num(u.input_tokens) ??
+    num(u.promptTokens) ??
+    num(u.prompt_tokens) ??
+    num(m.inputTokens) ??
+    num(m.input_tokens);
+  const output =
+    num(u.outputTokens) ??
+    num(u.output_tokens) ??
+    num(u.completionTokens) ??
+    num(u.completion_tokens) ??
+    num(m.outputTokens);
   const total =
+    used ??
     num(u.totalTokens) ??
     num(u.total_tokens) ??
     num(m.totalTokens) ??
     num(m.total_tokens);
-  const input = num(u.inputTokens) ?? num(u.input_tokens) ?? num(m.inputTokens);
-  const output = num(u.outputTokens) ?? num(u.output_tokens) ?? num(m.outputTokens);
-  const cached = num(u.cachedReadTokens) ?? num(u.cached_read_tokens) ?? num(m.cachedReadTokens);
+  const cached =
+    num(u.cachedReadTokens) ??
+    num(u.cached_read_tokens) ??
+    num(u.cacheReadTokens) ??
+    num(u.cache_read_input_tokens) ??
+    num(m.cachedReadTokens);
   const reasoning = num(u.reasoningTokens) ?? num(u.reasoning_tokens);
-  if (total == null && input == null && output == null) return null;
+
+  if (total == null && input == null && output == null && used == null) return null;
   return {
-    totalTokens: total ?? (input != null || output != null ? (input || 0) + (output || 0) : undefined),
+    totalTokens:
+      total ?? (input != null || output != null ? (input || 0) + (output || 0) : undefined),
     inputTokens: input,
     outputTokens: output,
     cachedReadTokens: cached,
     reasoningTokens: reasoning,
-    contextLimit,
+    contextLimit: limit,
+  };
+}
+
+function mergeUsage(prev: TokenUsage | null, next: TokenUsage): TokenUsage {
+  return {
+    ...(prev || {}),
+    ...next,
+    inputTokens: next.inputTokens ?? prev?.inputTokens,
+    outputTokens: next.outputTokens ?? prev?.outputTokens,
+    totalTokens: next.totalTokens ?? prev?.totalTokens,
+    cachedReadTokens: next.cachedReadTokens ?? prev?.cachedReadTokens,
+    reasoningTokens: next.reasoningTokens ?? prev?.reasoningTokens,
+    contextLimit: next.contextLimit ?? prev?.contextLimit,
+    compactedAt: next.compactedAt ?? prev?.compactedAt,
+    tokensBeforeCompact: next.tokensBeforeCompact ?? prev?.tokensBeforeCompact,
   };
 }
 
 function num(v: unknown): number | undefined {
-  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim()) {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
 }
 
 export type { StreamEvent };

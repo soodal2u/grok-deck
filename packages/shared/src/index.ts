@@ -136,6 +136,10 @@ export interface TokenUsage {
   cachedReadTokens?: number;
   reasoningTokens?: number;
   contextLimit?: number;
+  /** Unix ms when /compact last succeeded for this workspace */
+  compactedAt?: number;
+  /** Token count immediately before the last compact */
+  tokensBeforeCompact?: number;
 }
 
 export interface GhostFileStat {
@@ -197,9 +201,38 @@ export interface PromptAttachmentRef {
   mimeType?: string;
 }
 
+/** Renderer → main: clipboard image (screenshot / Ctrl+V). `data` is raw base64. */
+export interface ClipboardImagePayload {
+  mimeType: string;
+  data: string;
+  name?: string;
+}
+
 export interface PromptRequest {
   text: string;
   attachments?: PromptAttachmentRef[];
+  sessionId?: string;
+  cwd?: string;
+}
+
+export interface QueuedMessage {
+  id: string;
+  text: string;
+  createdAt: number;
+}
+
+export interface ThreadSnapshot {
+  sessionId: string;
+  cwd: string;
+  messages: ChatMessage[];
+  queue: QueuedMessage[];
+  updatedAt: number;
+}
+
+export interface AgentThreadInfo {
+  cwd: string;
+  sessionId: string;
+  state: "idle" | "starting" | "ready" | "running" | "error";
 }
 
 export interface SkillInfo {
@@ -216,7 +249,9 @@ export interface WorkspaceFileEntry {
   isDir?: boolean;
 }
 
-export type StreamEvent =
+type SessionTag = { sessionId?: string; cwd?: string };
+
+type StreamEventBody =
   | { type: "text"; text: string }
   | { type: "thought"; text: string }
   | { type: "tool_call"; call: ToolCallView }
@@ -238,6 +273,14 @@ export type StreamEvent =
   | { type: "mode"; mode: DeckMode }
   | { type: "usage"; usage: TokenUsage }
   | { type: "context_limit"; limit: number }
+  | {
+      type: "compact";
+      status: "started" | "done" | "failed";
+      before?: number;
+      after?: number;
+      message?: string;
+      usage?: TokenUsage;
+    }
   | { type: "ghost_commit"; commit: GhostCommitInfo }
   | { type: "ghost_undo"; commit: GhostCommitInfo }
   | { type: "ghost_status"; ghost: GhostStatus }
@@ -251,6 +294,8 @@ export type StreamEvent =
     }
   | { type: "error"; message: string }
   | { type: "status"; message: string };
+
+export type StreamEvent = StreamEventBody & SessionTag;
 
 export interface ChatMessage {
   id: string;
@@ -313,6 +358,10 @@ export interface AppSettings {
   sidebarWidth?: number;
   /** Right review panel width in px */
   rightWidth?: number;
+  /** User-defined project list order (cwd paths) */
+  projectOrder?: string[];
+  /** Sidebar project expand state keyed by cwd. Missing key = expanded. */
+  sidebarExpanded?: Record<string, boolean>;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -324,6 +373,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   wallpaperOpacity: 0.22,
   sidebarWidth: 260,
   rightWidth: 300,
+  projectOrder: [],
+  sidebarExpanded: {},
 };
 
 export const PANEL_LIMITS = {
@@ -347,6 +398,7 @@ export const BUILTIN_SLASH: SlashCommand[] = [
 ];
 
 export const IpcChannels = {
+  appGetVersion: "app:get-version",
   authGetStatus: "auth:get-status",
   authLogin: "auth:login",
   authLogout: "auth:logout",
@@ -359,6 +411,9 @@ export const IpcChannels = {
   sessionsList: "sessions:list",
   sessionsTranscript: "sessions:transcript",
   sessionsDelete: "sessions:delete",
+  threadGet: "thread:get",
+  threadSet: "thread:set",
+  agentThreads: "agent:threads",
   projectCreate: "project:create",
   themesList: "themes:list",
   themesImportFile: "themes:import-file",
@@ -385,6 +440,7 @@ export const IpcChannels = {
   ghostStatus: "ghost:status",
   attachmentsPick: "attachments:pick",
   attachmentsFromPaths: "attachments:from-paths",
+  attachmentsFromData: "attachments:from-data",
   skillsList: "skills:list",
   workspaceSearchFiles: "workspace:search-files",
 } as const;

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ToolCallView } from "@grok-deck/shared";
 import { isEditTool } from "@grok-deck/shared";
 import { ToolChip } from "./ToolChip";
@@ -36,7 +36,9 @@ function iconFor(t: ToolCallView): string {
  * Collapsed by default so assistant text stays visible; click to expand full chips.
  */
 export function LiveToolToast({ tools }: { tools: ToolCallView[] }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const stickRef = useRef(true);
 
   const summary = useMemo(() => {
     if (!tools.length) return null;
@@ -56,6 +58,12 @@ export function LiveToolToast({ tools }: { tools: ToolCallView[] }) {
     };
   }, [tools]);
 
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!expanded || !el || !stickRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [tools, expanded]);
+
   if (!summary) return null;
 
   const headline =
@@ -70,9 +78,11 @@ export function LiveToolToast({ tools }: { tools: ToolCallView[] }) {
       ? `${summary.verb} · ${summary.done}/${summary.total} 완료${
           summary.failed ? ` · 실패 ${summary.failed}` : ""
         }`
-      : summary.failed
-        ? "클릭해서 상세 보기"
-        : "클릭해서 펼치기";
+      : expanded
+        ? "목록을 스크롤해서 도구를 확인하세요"
+        : summary.failed
+          ? "클릭해서 상세 보기"
+          : "클릭해서 펼치기";
 
   return (
     <div className={`live-tool-toast ${expanded ? "open" : "collapsed"}`}>
@@ -91,7 +101,15 @@ export function LiveToolToast({ tools }: { tools: ToolCallView[] }) {
         <span className="ltt-chev">{expanded ? "▾" : "▸"}</span>
       </button>
       {expanded ? (
-        <div className="live-tool-toast-body">
+        <div
+          className="live-tool-toast-body"
+          ref={bodyRef}
+          onScroll={() => {
+            const el = bodyRef.current;
+            if (!el) return;
+            stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+          }}
+        >
           {tools.map((t) => (
             <ToolChip key={t.id} tool={t} />
           ))}

@@ -1,6 +1,7 @@
-import { useMemo, type MouseEvent, type ReactNode } from "react";
+import { memo, useMemo, useRef, type MouseEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { hrefToLocalPath, looksLikePath, prepareMarkdownPaths } from "../path-links";
 import hljs from "highlight.js/lib/core";
 import javascript from "highlight.js/lib/languages/javascript";
 import typescript from "highlight.js/lib/languages/typescript";
@@ -31,6 +32,8 @@ hljs.registerLanguage("css", css);
 hljs.registerLanguage("md", markdown);
 hljs.registerLanguage("markdown", markdown);
 
+const REMARK_PLUGINS = [remarkGfm];
+
 function highlightCode(code: string, lang?: string): string {
   try {
     if (lang && hljs.getLanguage(lang)) {
@@ -50,47 +53,7 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
-/**
- * Convert bare paths to markdown links without breaking existing [text](url) links.
- */
-function linkifyPaths(text: string): string {
-  // Protect existing markdown links
-  const placeholders: string[] = [];
-  let protectedText = text.replace(/\[([^\]]*)\]\(([^)]+)\)/g, (full) => {
-    const i = placeholders.length;
-    placeholders.push(full);
-    return `\u0000MD${i}\u0000`;
-  });
-
-  // Bare paths / image refs
-  const re =
-    /((?:[A-Za-z]:\\|\\\\)[^\s`"'<>|\]]+|(?:\.\/)?(?:images?|attachments?)\/[^\s`"'<>|\]]+)/g;
-
-  protectedText = protectedText.replace(re, (match) => {
-    let path = match;
-    let trailing = "";
-    while (/[.,;:!?)]$/.test(path)) {
-      trailing = path.slice(-1) + trailing;
-      path = path.slice(0, -1);
-    }
-    if (!path) return match;
-    return `[${path}](${path})${trailing}`;
-  });
-
-  return protectedText.replace(/\u0000MD(\d+)\u0000/g, (_, n) => placeholders[Number(n)] || "");
-}
-
-function looksLikePath(s: string): boolean {
-  const t = s.trim();
-  if (!t) return false;
-  if (/^https?:\/\//i.test(t)) return false;
-  if (/^[A-Za-z]:[\\/]/.test(t)) return true;
-  if (/^(?:\.\/)?(?:images?|attachments?)\//i.test(t)) return true;
-  if (/\.(png|jpe?g|webp|gif|mp4|webm|pdf|md|ts|tsx|js|json|py|txt)$/i.test(t)) return true;
-  return false;
-}
-
-export function Markdown({
+export const Markdown = memo(function Markdown({
   text,
   projectRoot,
   onStatus,
@@ -99,30 +62,28 @@ export function Markdown({
   projectRoot?: string | null;
   onStatus?: (msg: string) => void;
 }) {
-  const prepared = useMemo(() => linkifyPaths(text), [text]);
-
-  const openLocal = async (href: string) => {
-    let target = href.trim();
-    try {
-      target = decodeURIComponent(target);
-    } catch {
-      /* keep */
-    }
-    // Normalize markdown leftover
-    const md = target.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-    if (md) target = (md[2] || md[1] || target).trim();
-
-    const res = await window.grokDeck.shell.openPath(target, projectRoot || undefined);
-    if (res.ok) {
-      onStatus?.(`열림: ${res.resolved || target}`);
-    } else {
-      onStatus?.(res.message || `열기 실패: ${target}`);
-      console.warn("openPath failed", res);
-    }
-  };
+  const prepared = useMemo(() => prepareMarkdownPaths(text), [text]);
+  const projectRootRef = useRef(projectRoot);
+  projectRootRef.current = projectRoot;
+  const onStatusRef = useRef(onStatus);
+  onStatusRef.current = onStatus;
 
   const components = useMemo(
-    () => ({
+    () => {
+      const openLocal = async (href: string) => {
+        const target = hrefToLocalPath(href);
+        const res = await window.grokDeck.shell.openPath(
+          target,
+          projectRootRef.current || undefined,
+        );
+        if (res.ok) {
+          onStatusRef.current?.(`열림: ${res.resolved || target}`);
+        } else {
+          onStatusRef.current?.(res.message || `열기 실패: ${target}`);
+          console.warn("openPath failed", res);
+        }
+      };
+      return {
       code({
         className,
         children,
@@ -190,27 +151,34 @@ export function Markdown({
           void openLocal(href);
         };
         const local = href ? !/^https?:\/\//i.test(href) && !/^mailto:/i.test(href) : false;
+        const localPath = local ? hrefToLocalPath(href || "") : "";
         return (
           <a
             href={href || "#"}
             className={local ? "md-path-link" : undefined}
-            title={local ? `클릭 → 탐색기에서 열기 (${href})` : href}
+            title={local ? `클릭 → 탐색기에서 열기 (${localPath || href})` : href}
             onClick={handle}
           >
             {children}
           </a>
         );
       },
-    }),
-    // openLocal closes over projectRoot/onStatus
-    [projectRoot, onStatus],
+      p({ children }: { children?: ReactNode }) {
+        return <p className="md-p">{children}</p>;
+      },
+      li({ children }: { children?: ReactNode }) {
+        return <li className="md-li">{children}</li>;
+      },
+    };
+    },
+    [],
   );
 
   return (
     <div className="md-body">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components as never}>
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={components as never}>
         {prepared}
       </ReactMarkdown>
     </div>
   );
-}
+});

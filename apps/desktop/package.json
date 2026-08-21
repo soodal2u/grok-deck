@@ -1,6 +1,6 @@
 {
   "name": "grok-deck",
-  "version": "0.4.3",
+  "version": "0.5.4",
   "private": true,
   "description": "Grok Deck desktop command center for Grok agents",
   "main": "./out/main/index.js",
